@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include "config.h"
 #include "espnow_p2p.h"
+#include "protocol_v2.h"
 
 namespace mesh {
 
@@ -55,6 +56,28 @@ typedef void (*CommandCallback)(
   uint32_t sensor_id,
   uint32_t value,
   bool state);
+
+// V2 Protocol Callbacks (Phase 3)
+typedef void (*V2EntityAnnounceCallback)(
+  uint32_t remote_uid,
+  const char *remote_ip,
+  const qymera::protocol::v2::EntityAnnouncePayload &payload);
+
+typedef void (*V2StateUpdateCallback)(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::StateUpdatePayload &payload);
+
+typedef void (*V2CommandCallback)(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandPayload &payload);
+
+typedef void (*V2CommandAckCallback)(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandAckPayload &payload);
+
+typedef void (*V2CommandErrorCallback)(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandErrorPayload &payload);
 
 // ============================================================================
 // Reportes
@@ -198,6 +221,26 @@ void sendCommand(
   uint8_t type,
   uint32_t value,
   bool state);
+
+// V2 Protocol Sends (Phase 3)
+void sendV2Hello();
+void sendV2EntityAnnounce(uint8_t index);
+void sendV2StateUpdate(uint8_t index);
+void sendV2Command(uint32_t remote_uid, const char *remote_ip,
+                   uint32_t entity_id, uint8_t type, uint32_t value, bool state,
+                   bool ack_requested = true);
+void sendV2CommandAck(uint32_t remote_uid, const char *remote_ip,
+                      uint32_t msg_id, uint32_t entity_id, uint8_t status);
+void sendV2CommandError(uint32_t remote_uid, const char *remote_ip,
+                        uint32_t msg_id, uint32_t entity_id, uint8_t status,
+                        const char *message);
+
+// V2 Callback Registration
+void setV2EntityAnnounceCallback(V2EntityAnnounceCallback cb);
+void setV2StateUpdateCallback(V2StateUpdateCallback cb);
+void setV2CommandCallback(V2CommandCallback cb);
+void setV2CommandAckCallback(V2CommandAckCallback cb);
+void setV2CommandErrorCallback(V2CommandErrorCallback cb);
 
 // ============================================================================
 // Utilidades

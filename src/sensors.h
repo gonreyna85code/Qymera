@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "config.h"
+#include "protocol_v2.h"
 
 namespace sensors {
 
@@ -155,5 +156,27 @@ void onRemoteCommand(
   uint32_t sensor_id,
   uint32_t value,
   bool state);
+
+// V2 Protocol Callbacks (Phase 3)
+void onV2EntityAnnounce(
+  uint32_t remote_uid,
+  const char *remote_ip,
+  const qymera::protocol::v2::EntityAnnouncePayload &payload);
+
+void onV2StateUpdate(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::StateUpdatePayload &payload);
+
+void onV2Command(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandPayload &payload);
+
+void onV2CommandAck(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandAckPayload &payload);
+
+void onV2CommandError(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandErrorPayload &payload);
 
 }  // namespace sensors

@@ -393,3 +393,49 @@ struct Envelope {
 2. **Version negotiation**: `HELLO` exchange announces supported versions
 3. **Graceful degradation**: Unknown versions dropped, known versions parsed
 4. **Migration**: Devices advertise V2 capability in `HELLO`; controllers prefer V2
+
+---
+
+## 10. Phase 3 Delivered (2026-08-31)
+
+**Scope**: Per professionalization roadmap Phase 3 — introduce explicit Protocol V2 envelope/payload separation with message types, carrying stable `entity_id`, dual-stack backward compatibility with v1-v5.
+
+### Delivered
+
+| Artifact | Purpose |
+|----------|---------|
+| `src/protocol_v2.h` | Pure C++ V2 protocol definitions: `Envelope` (24 bytes, magic 0xA6), 7 message types (`HELLO`, `ENTITY_ANNOUNCE`, `STATE_UPDATE`, `COMMAND`, `COMMAND_ACK`, `COMMAND_ERROR`, `LOG`), typed payloads, CRC16 integrity, build/parse helpers, callback typedefs. |
+| `src/mesh.h/cpp` | Dual-stack parser: tries V2 first (magic 0xA6), falls back to legacy v1-v5 (magic 0xA5). V2 callbacks registered and dispatched. V2 send functions: `sendV2Hello()`, `sendV2EntityAnnounce()`, `sendV2StateUpdate()`, `sendV2Command()`, `sendV2CommandAck()`, `sendV2CommandError()`. |
+| `src/sensors.cpp` | V2 callback handlers: `onV2EntityAnnounce()` (matches by `entity_id`), `onV2StateUpdate()`, `onV2Command()` (executes local actuator, sends ACK), `onV2CommandAck()`, `onV2CommandError()`. Commands target stable `entity_id` (not legacy `uid`). |
+| `tests/host_sanity.py` | +16 Protocol V2 tests: envelope build/parse, CRC validation, magic/version/size rejection, all 7 message type round-trips (HELLO, ENTITY_ANNOUNCE 64B, STATE_UPDATE 12B, COMMAND 16B, COMMAND_ACK 12B, COMMAND_ERROR 44B, LOG 64B). Host tests: **102/102 PASS** (86 baseline + 16 new). |
+| Build matrix | All 3 environments PASS. Memory: +~256 bytes RAM (V2 structures). ESP8266 70.3% / 42.6%; ESP32 22.7% / 74.0%; ESP32-C3 21.0% / 73.1%. |
+
+### Key Design Decisions
+
+- **Dual-stack parsing**: V2 tried first (magic 0xA6), then legacy (magic 0xA5). No protocol version negotiation yet — devices generate both.
+- **Stable `entity_id` on wire**: V2 `ENTITY_ANNOUNCE` and `COMMAND` carry `entity_id` (Phase 2 identity), not legacy `uid`. Legacy `uid` still sent for backward compatibility.
+- **Command ACK**: `COMMAND` with `ACK_REQ` flag → receiver sends `COMMAND_ACK` immediately. Full retry logic deferred to Phase 4.
+- **CRC16 payload integrity**: All V2 frames carry CRC16 of payload; corrupted frames rejected.
+- **Backward compatibility**: Legacy v1-v5 parsing unchanged; existing devices interoperate.
+
+### Compatibility Matrix
+
+| Feature | Legacy v1-v5 | V2 |
+|---------|-------------|-----|
+| Discovery | Broadcast `Packet` (uid) | `ENTITY_ANNOUNCE` (entity_id) |
+| State updates | Broadcast `Packet` | `STATE_UPDATE` (entity_id + delta) |
+| Commands | Unicast `Packet` (uid) | `COMMAND` (entity_id + msg_id + ACK_REQ) |
+| ACK/Error | None | `COMMAND_ACK`, `COMMAND_ERROR` |
+| Logs | `LogPacket` (broadcast) | `LOG` (structured, CRC) |
+| Version negotiation | None | `HELLO` announces capabilities |
+
+### Next (Phase 4: Command Delivery Semantics)
+
+- Reliable command delivery: retry with exponential backoff
+- Duplicate detection (msg_id tracking)
+- Timeout and retransmission logic
+- Pending command queue per peer
+
+---
+
+## 9. Known Limitations (Baseline)

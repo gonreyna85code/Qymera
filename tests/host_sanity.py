@@ -394,6 +394,134 @@ seed = bind_local_sensor(c, seed, 0x12345678)  # second call - should NOT reassi
 check("bindLocalSensor assigns entity_id once", c.entity_id == eid_first)
 check("bindLocalSeed increments seed", c.entity_id != 0)
 
+# ---------------------------------------------------------------- protocol v2
+# src/protocol_v2.h: qymera::protocol::v2 envelope/payload, CRC16, build/parse
+# Mirrors: Envelope, HelloPayload, EntityAnnouncePayload, StateUpdatePayload,
+# CommandPayload, CommandAckPayload, CommandErrorPayload, LogPayload
+
+import struct
+
+V2_MAGIC = 0xA6
+V2_VERSION = 2
+
+def crc16_ccitt_py(data, crc=0xFFFF):
+    for b in data:
+        crc ^= (b << 8) & 0xFFFF
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc
+
+def build_frame(msg_type, src_uid, dst_uid, msg_id, flags, payload_bytes):
+    # Envelope: magic(1) version(1) flags(2) msg_id(4) seq(2) src_uid(4) dst_uid(4) msg_type(1) payload_len(2) crc16(2) reserved(1) = 24
+    # Format: <BBHIHIIBHHB
+    env = struct.pack('<BBHIHIIBHHB',
+                      V2_MAGIC, V2_VERSION, flags, msg_id, 0,
+                      src_uid, dst_uid, msg_type, len(payload_bytes),
+                      crc16_ccitt_py(payload_bytes) if payload_bytes else 0, 0)
+    return env + payload_bytes
+
+def parse_frame(buf):
+    if len(buf) < 24: return None
+    magic, version, flags, msg_id, seq, src_uid, dst_uid, msg_type, payload_len, crc16, reserved = struct.unpack('<BBHIHIIBHHB', buf[:24])
+    if magic != V2_MAGIC or version != V2_VERSION: return None
+    if len(buf) != 24 + payload_len: return None
+    payload = buf[24:]
+    if payload_len > 0 and crc16_ccitt_py(payload) != crc16: return None
+    return {
+        'magic': magic, 'version': version, 'flags': flags, 'msg_id': msg_id,
+        'seq': seq, 'src_uid': src_uid, 'dst_uid': dst_uid,
+        'msg_type': msg_type, 'payload_len': payload_len, 'crc16': crc16,
+        'payload': payload
+    }
+
+# Message type constants
+V2_HELLO = 0x01
+V2_ENTITY_ANNOUNCE = 0x02
+V2_STATE_UPDATE = 0x03
+V2_COMMAND = 0x04
+V2_COMMAND_ACK = 0x05
+V2_COMMAND_ERROR = 0x06
+V2_LOG = 0x07
+
+FLAGS_ACK_REQ = 0x0001
+
+print("[protocol v2]")
+# Envelope round-trip
+payload = b'\x00' * 8  # HelloPayload (8 bytes)
+frame = build_frame(V2_HELLO, 0x12345678, 0, 42, 0, payload)
+parsed = parse_frame(frame)
+check("V2 envelope build/parse", parsed is not None)
+check("V2 envelope fields", parsed['msg_type'] == V2_HELLO and parsed['src_uid'] == 0x12345678 and parsed['msg_id'] == 42)
+check("V2 envelope payload_len", parsed['payload_len'] == 8)
+check("V2 envelope CRC valid", True)
+
+# CRC validation: corrupt payload -> parse fails
+corrupt = bytearray(frame)
+corrupt[30] ^= 0xFF  # flip a payload byte
+check("V2 CRC rejects corruption", parse_frame(bytes(corrupt)) is None)
+
+# Wrong magic -> reject
+wrong_magic = bytearray(frame)
+wrong_magic[0] = 0xA5
+check("V2 wrong magic rejected", parse_frame(bytes(wrong_magic)) is None)
+
+# Wrong version -> reject
+wrong_ver = bytearray(frame)
+wrong_ver[1] = 1
+check("V2 wrong version rejected", parse_frame(bytes(wrong_ver)) is None)
+
+# Payload size mismatch -> reject
+wrong_len = bytearray(frame)
+wrong_len = wrong_len[:-1]  # truncate
+check("V2 size mismatch rejected", parse_frame(bytes(wrong_len)) is None)
+
+# HelloPayload encode/decode
+hello = struct.pack('<IHBB', 0x12345678, 0x000F, 0x0F, 0)  # device_id, caps, proto_vers, reserved
+frame = build_frame(V2_HELLO, 0x12345678, 0, 1, 0, hello)
+parsed = parse_frame(frame)
+check("V2 HELLO round-trip", parsed is not None and len(parsed['payload']) == 8)
+
+# EntityAnnouncePayload encode/decode (64 bytes)
+# Format: entity_id(I) device_id(I) type(B) cap(B) own(B) resv(B) name(24s) min(f) max(f) corr(f) avail(B) persist(B) pstate(B) pulse(B) pulse_ms(I) fade(I) reserved2(4s)
+eap = struct.pack('<IIBBBB24sfffBBBBII4s',
+    0x87654321, 0x12345678, 9, 3, 1, 0,
+    b'Test Relay\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    0.0, 100.0, 0.0, 1, 1, 1, 0, 0, 1000, b'\x00\x00\x00\x00')
+frame = build_frame(V2_ENTITY_ANNOUNCE, 0x12345678, 0, 2, 0, eap)
+parsed = parse_frame(frame)
+check("V2 ENTITY_ANNOUNCE round-trip", parsed is not None and parsed['payload_len'] == 64)
+
+# StateUpdatePayload (12 bytes): entity_id(I) value(I) state(B) avail(B) reserved(H)
+sup = struct.pack('<IIBHB', 0x87654321, 0xABCD1234, 1, 1, 0)
+frame = build_frame(V2_STATE_UPDATE, 0x12345678, 0, 3, 0, sup)
+parsed = parse_frame(frame)
+check("V2 STATE_UPDATE round-trip", parsed is not None and parsed['payload_len'] == 12)
+
+# CommandPayload (16 bytes): entity_id(I) type(B) flags(B) reserved(H) value(I) state(B) reserved2[3](BBB)
+cp = struct.pack('<IBBHIBBBB', 0x87654321, 9, FLAGS_ACK_REQ, 0, 1, 1, 0, 0, 0)
+frame = build_frame(V2_COMMAND, 0x12345678, 0x87654321, 4, FLAGS_ACK_REQ, cp)
+parsed = parse_frame(frame)
+check("V2 COMMAND round-trip", parsed is not None and parsed['payload_len'] == 16)
+check("V2 COMMAND ACK_REQ flag", parsed['flags'] & FLAGS_ACK_REQ)
+
+# CommandAckPayload (12 bytes): msg_id(I) entity_id(I) status(B) reserved(3B)
+cap = struct.pack('<IIB3s', 4, 0x87654321, 0, b'\x00\x00\x00')
+frame = build_frame(V2_COMMAND_ACK, 0x87654321, 0x12345678, 5, 0, cap)
+parsed = parse_frame(frame)
+check("V2 COMMAND_ACK round-trip", parsed is not None and parsed['payload_len'] == 12)
+
+# CommandErrorPayload (44 bytes): msg_id(I) entity_id(I) error_code(B) reserved(3B) message[32](32s)
+cep = struct.pack('<IIB3s32s', 4, 0x87654321, 1, b'\x00\x00\x00', b'Not found\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+frame = build_frame(V2_COMMAND_ERROR, 0x87654321, 0x12345678, 6, 0, cep)
+parsed = parse_frame(frame)
+check("V2 COMMAND_ERROR round-trip", parsed is not None and parsed['payload_len'] == 44)
+
+# LogPayload (64 bytes): layer(B) level(B) reserved(H) timestamp(I) message[56](56s)
+lp = struct.pack('<BBHI56s', 1, 1, 0, 1704067200, b'Test log message\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+frame = build_frame(V2_LOG, 0x12345678, 0, 7, 0, lp)
+parsed = parse_frame(frame)
+check("V2 LOG round-trip", parsed is not None and parsed['payload_len'] == 64)
+
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)

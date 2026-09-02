@@ -3,6 +3,7 @@
 #include "core.h"
 #include "sensors.h"
 #include "log.h"
+#include "model.h"
 
 namespace mesh {
 
@@ -27,6 +28,16 @@ static WiFiUDP mesh_udp;
 static WiFiUDP cmd_udp;
 static SensorDiscoveryCallback sensor_callback = nullptr;
 static CommandCallback command_cb = nullptr;
+
+// V2 Protocol Callbacks
+static qymera::protocol::v2::V2EntityAnnounceCallback v2_entity_announce_cb = nullptr;
+static qymera::protocol::v2::V2StateUpdateCallback v2_state_update_cb = nullptr;
+static qymera::protocol::v2::V2CommandCallback v2_command_cb = nullptr;
+static qymera::protocol::v2::V2CommandAckCallback v2_command_ack_cb = nullptr;
+static qymera::protocol::v2::V2CommandErrorCallback v2_command_error_cb = nullptr;
+
+// V2 message ID counter (monotonic per device)
+static uint32_t v2_msg_id_counter = 1;
 
 // ================= TRANSPORT =================
 static Transport transport = TRANSPORT_UDP;
@@ -64,9 +75,134 @@ void setCommandCallback(CommandCallback cb) {
   command_cb = cb;
 }
 
+// V2 Callback Registration
+void setV2EntityAnnounceCallback(qymera::protocol::v2::V2EntityAnnounceCallback cb) {
+  v2_entity_announce_cb = cb;
+}
+
+void setV2StateUpdateCallback(qymera::protocol::v2::V2StateUpdateCallback cb) {
+  v2_state_update_cb = cb;
+}
+
+void setV2CommandCallback(qymera::protocol::v2::V2CommandCallback cb) {
+  v2_command_cb = cb;
+}
+
+void setV2CommandAckCallback(qymera::protocol::v2::V2CommandAckCallback cb) {
+  v2_command_ack_cb = cb;
+}
+
+void setV2CommandErrorCallback(qymera::protocol::v2::V2CommandErrorCallback cb) {
+  v2_command_error_cb = cb;
+}
+
 // ================= BUFFER PARSER (shared) =================
 
+static void parseV2Frame(const uint8_t *buf, uint16_t len, const char *remote_ip, uint32_t now_ms) {
+  using namespace qymera::protocol::v2;
+  Envelope env;
+  const uint8_t *payload_ptr = nullptr;
+  uint16_t payload_len = 0;
+  if (!parseFrame(buf, len, env, payload_ptr, payload_len)) return;
+
+  uint32_t local_uid = GET_CHIP_ID();
+  bool is_remote = (env.src_uid != local_uid);
+
+  if (!is_remote) {
+    // Locally originated V2 frame (e.g., our own broadcast reflected) - ignore
+    return;
+  }
+
+  // Track remote device
+  int idx = -1;
+  for (int i = 0; i < remote_device_count; i++) {
+    if (remote_devices[i].uid == env.src_uid) { idx = i; break; }
+  }
+  if (idx == -1 && remote_device_count < MAX_SENSORS) {
+    idx = remote_device_count++;
+  }
+  if (idx >= 0) {
+    remote_devices[idx].uid = env.src_uid;
+    strncpy(remote_devices[idx].ip, remote_ip, sizeof(remote_devices[idx].ip) - 1);
+    remote_devices[idx].ip[sizeof(remote_devices[idx].ip) - 1] = '\0';
+    remote_devices[idx].last_seen = now_ms;
+    remote_devices[idx].online = true;
+  }
+
+  // Dispatch by message type
+  switch ((MsgType)env.msg_type) {
+    case MsgType::HELLO: {
+      const HelloPayload *hp = asHello(payload_ptr, payload_len);
+      if (hp) {
+        logger::coref("V2 HELLO from %08X caps=%04X", env.src_uid, hp->capabilities);
+        // Could trigger capability negotiation here
+      }
+      break;
+    }
+    case MsgType::ENTITY_ANNOUNCE: {
+      const EntityAnnouncePayload *eap = asEntityAnnounce(payload_ptr, payload_len);
+      if (eap && v2_entity_announce_cb) {
+        v2_entity_announce_cb(env.src_uid, remote_ip, *eap);
+      }
+      break;
+    }
+    case MsgType::STATE_UPDATE: {
+      const StateUpdatePayload *sup = asStateUpdate(payload_ptr, payload_len);
+      if (sup && v2_state_update_cb) {
+        v2_state_update_cb(env.src_uid, *sup);
+      }
+      break;
+    }
+    case MsgType::COMMAND: {
+      const CommandPayload *cp = asCommand(payload_ptr, payload_len);
+      if (cp && v2_command_cb) {
+        v2_command_cb(env.src_uid, *cp);
+      }
+      // If ACK requested, send ACK
+      if (cp && (env.flags & (uint16_t)Flags::ACK_REQ)) {
+        // ACK with OK status - actual command execution happens in callback
+        // We don't know the result here; the callback will handle execution
+        // For now, send a provisional ACK. Full implementation needs callback to return status.
+        sendV2CommandAck(env.src_uid, remote_ip, env.msg_id, cp->entity_id, 0);
+      }
+      break;
+    }
+    case MsgType::COMMAND_ACK: {
+      const CommandAckPayload *cap = asCommandAck(payload_ptr, payload_len);
+      if (cap && v2_command_ack_cb) {
+        v2_command_ack_cb(env.src_uid, *cap);
+      }
+      break;
+    }
+    case MsgType::COMMAND_ERROR: {
+      const CommandErrorPayload *cep = asCommandError(payload_ptr, payload_len);
+      if (cep && v2_command_error_cb) {
+        v2_command_error_cb(env.src_uid, *cep);
+      }
+      break;
+    }
+    case MsgType::LOG: {
+      const LogPayload *lp = asLog(payload_ptr, payload_len);
+      if (lp && lp->layer <= logger::EVENTS && lp->level <= logger::ERROR) {
+        logger::logRemote((logger::Layer)lp->layer, (logger::Level)lp->level, lp->message);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 static void parseBuffer(const uint8_t *buf, uint16_t len, const char *remote_ip, uint32_t now_ms) {
+  // Try V2 first (magic 0xA6)
+  if (len >= sizeof(qymera::protocol::v2::Envelope)) {
+    if (buf[0] == qymera::protocol::v2::V2_MAGIC) {
+      parseV2Frame(buf, len, remote_ip, now_ms);
+      return;  // V2 frame handled, don't fall through to legacy
+    }
+  }
+
+  // Legacy v1-v5 parsing (magic 0xA5)
   if (len < sizeof(PacketHeader)) return;
   PacketHeader hdr;
   memcpy(&hdr, buf, sizeof(hdr));
@@ -435,6 +571,195 @@ void sendLog(uint8_t layer, uint8_t level, const char *message) {
     }
   } else if (espnow_is_enabled()) {
     espnow_send_broadcast(buf, sizeof(buf));
+  }
+}
+
+// ================= PROTOCOL V2 SENDS =================
+
+static void v2SendUDP(const uint8_t *buf, uint16_t len) {
+  if (!udpTxReady()) return;
+  udp.beginPacket("255.255.255.255", core::genset.broadcast_port);
+  udp.write(buf, len);
+  udp.endPacket();
+}
+
+static void v2SendCommandUDP(const uint8_t *buf, uint16_t len, const char *remote_ip) {
+  cmd_udp.beginPacket(remote_ip, core::genset.command_port);
+  cmd_udp.write(buf, len);
+  cmd_udp.endPacket();
+}
+
+void sendV2Hello() {
+  using namespace qymera::protocol::v2;
+  HelloPayload hp = {};
+  hp.device_id = GET_CHIP_ID();
+  hp.capabilities = (uint16_t)Capability::ENTITY_ANNOUNCE |
+                    (uint16_t)Capability::STATE_UPDATE |
+                    (uint16_t)Capability::COMMAND_ACK |
+                    (uint16_t)Capability::COMMAND_ERROR;
+  hp.protocol_versions = 0x1F;  // v1-v5 supported
+
+  uint8_t buf[sizeof(Envelope) + sizeof(HelloPayload)];
+  uint16_t frame_len = buildFrame(buf, sizeof(buf),
+                                  MsgType::HELLO, GET_CHIP_ID(), 0,  // broadcast
+                                  v2_msg_id_counter++, (uint16_t)Flags::NONE,
+                                  &hp, sizeof(hp));
+  if (frame_len == 0) return;
+
+  if (transport == TRANSPORT_UDP) {
+    v2SendUDP(buf, frame_len);
+  } else if (espnow_is_enabled()) {
+    espnow_send_broadcast(buf, frame_len);
+  }
+}
+
+void sendV2EntityAnnounce(uint8_t index) {
+  if (index >= MAX_SENSORS) return;
+  auto &c = sensors::calibrations[index];
+  if (!c.local || c.type == sensors::SENSOR_NONE || c.uid == 0) return;
+  if (c.entity_id == 0) return;  // not yet assigned
+
+  using namespace qymera::protocol::v2;
+  EntityAnnouncePayload eap = {};
+  eap.entity_id = c.entity_id;
+  eap.device_id = GET_CHIP_ID();
+  eap.type = c.type;
+  // Map capabilities
+  switch (c.type) {
+    case sensors::TYPE_RELAY:
+    case sensors::TYPE_DIMMER:
+      eap.capabilities = (uint8_t)qymera::model::EntityCapability::READ_WRITE;
+      break;
+    default:
+      eap.capabilities = (uint8_t)qymera::model::EntityCapability::READ;
+  }
+  eap.ownership = (uint8_t)qymera::model::EntityOwnership::OWNER_LOCAL;
+  strncpy(eap.name, c.name.c_str(), sizeof(eap.name) - 1);
+  eap.min = c.min;
+  eap.max = c.max;
+  eap.correction = c.correction;
+  eap.avail = c.avail;
+  eap.persist = c.persist ? 1 : 0;
+  eap.pers_state = c.pers_state ? 1 : 0;
+  eap.pulse = c.pulse ? 1 : 0;
+  eap.pulse_ms = c.pulse_ms;
+  eap.fade = c.fade;
+
+  uint8_t buf[sizeof(Envelope) + sizeof(EntityAnnouncePayload)];
+  uint16_t frame_len = buildFrame(buf, sizeof(buf),
+                                  MsgType::ENTITY_ANNOUNCE, GET_CHIP_ID(), 0,
+                                  v2_msg_id_counter++, (uint16_t)Flags::NONE,
+                                  &eap, sizeof(eap));
+  if (frame_len == 0) return;
+
+  if (transport == TRANSPORT_UDP) {
+    v2SendUDP(buf, frame_len);
+  } else if (espnow_is_enabled()) {
+    espnow_send_broadcast(buf, frame_len);
+  }
+}
+
+void sendV2StateUpdate(uint8_t index) {
+  if (index >= MAX_SENSORS) return;
+  auto &c = sensors::calibrations[index];
+  if (!c.local || c.type == sensors::SENSOR_NONE || c.uid == 0) return;
+  if (c.entity_id == 0) return;
+
+  using namespace qymera::protocol::v2;
+  StateUpdatePayload sup = {};
+  sup.entity_id = c.entity_id;
+  sup.value = (c.type == sensors::SENSOR_LUMI || c.type == sensors::SENSOR_TIME)
+                ? (uint32_t)c.value
+                : encodeFloat(c.value);
+  sup.state = c.state ? 1 : 0;
+  sup.avail = c.avail;
+
+  uint8_t buf[sizeof(Envelope) + sizeof(StateUpdatePayload)];
+  uint16_t frame_len = buildFrame(buf, sizeof(buf),
+                                  MsgType::STATE_UPDATE, GET_CHIP_ID(), 0,
+                                  v2_msg_id_counter++, (uint16_t)Flags::NONE,
+                                  &sup, sizeof(sup));
+  if (frame_len == 0) return;
+
+  if (transport == TRANSPORT_UDP) {
+    v2SendUDP(buf, frame_len);
+  } else if (espnow_is_enabled()) {
+    espnow_send_broadcast(buf, frame_len);
+  }
+}
+
+void sendV2Command(uint32_t remote_uid, const char *remote_ip,
+                   uint32_t entity_id, uint8_t type, uint32_t value, bool state,
+                   bool ack_requested) {
+  if (!getRemoteDevice(remote_uid)) return;
+
+  using namespace qymera::protocol::v2;
+  CommandPayload cp = {};
+  cp.entity_id = entity_id;
+  cp.type = type;
+  cp.flags = ack_requested ? (uint8_t)Flags::ACK_REQ : 0;
+  cp.value = value;
+  cp.state = state ? 1 : 0;
+
+  uint16_t flags = ack_requested ? (uint16_t)Flags::ACK_REQ : (uint16_t)Flags::NONE;
+  uint8_t buf[sizeof(Envelope) + sizeof(CommandPayload)];
+  uint16_t frame_len = buildFrame(buf, sizeof(buf),
+                                  MsgType::COMMAND, GET_CHIP_ID(), remote_uid,
+                                  v2_msg_id_counter++, flags,
+                                  &cp, sizeof(cp));
+  if (frame_len == 0) return;
+
+  if (transport == TRANSPORT_UDP) {
+    v2SendCommandUDP(buf, frame_len, remote_ip);
+  } else if (espnow_is_enabled()) {
+    // ESP-NOW: broadcast (no unicast)
+    espnow_send_broadcast(buf, frame_len);
+  }
+}
+
+void sendV2CommandAck(uint32_t remote_uid, const char *remote_ip,
+                      uint32_t msg_id, uint32_t entity_id, uint8_t status) {
+  using namespace qymera::protocol::v2;
+  CommandAckPayload cap = {};
+  cap.msg_id = msg_id;
+  cap.entity_id = entity_id;
+  cap.status = status;
+
+  uint8_t buf[sizeof(Envelope) + sizeof(CommandAckPayload)];
+  uint16_t frame_len = buildFrame(buf, sizeof(buf),
+                                  MsgType::COMMAND_ACK, GET_CHIP_ID(), remote_uid,
+                                  v2_msg_id_counter++, (uint16_t)Flags::NONE,
+                                  &cap, sizeof(cap));
+  if (frame_len == 0) return;
+
+  if (transport == TRANSPORT_UDP) {
+    v2SendCommandUDP(buf, frame_len, remote_ip);
+  } else if (espnow_is_enabled()) {
+    espnow_send_broadcast(buf, frame_len);
+  }
+}
+
+void sendV2CommandError(uint32_t remote_uid, const char *remote_ip,
+                        uint32_t msg_id, uint32_t entity_id, uint8_t status,
+                        const char *message) {
+  using namespace qymera::protocol::v2;
+  CommandErrorPayload cep = {};
+  cep.msg_id = msg_id;
+  cep.entity_id = entity_id;
+  cep.error_code = status;
+  if (message) strncpy(cep.message, message, sizeof(cep.message) - 1);
+
+  uint8_t buf[sizeof(Envelope) + sizeof(CommandErrorPayload)];
+  uint16_t frame_len = buildFrame(buf, sizeof(buf),
+                                  MsgType::COMMAND_ERROR, GET_CHIP_ID(), remote_uid,
+                                  v2_msg_id_counter++, (uint16_t)Flags::NONE,
+                                  &cep, sizeof(cep));
+  if (frame_len == 0) return;
+
+  if (transport == TRANSPORT_UDP) {
+    v2SendCommandUDP(buf, frame_len, remote_ip);
+  } else if (espnow_is_enabled()) {
+    espnow_send_broadcast(buf, frame_len);
   }
 }
 

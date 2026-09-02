@@ -86,6 +86,13 @@ void init() {
   }
   mesh::setSensorDiscoveryCallback(onRemoteSensorDiscovered);
   mesh::setCommandCallback(onRemoteCommand);
+
+  // V2 Protocol callbacks
+  mesh::setV2EntityAnnounceCallback(onV2EntityAnnounce);
+  mesh::setV2StateUpdateCallback(onV2StateUpdate);
+  mesh::setV2CommandCallback(onV2Command);
+  mesh::setV2CommandAckCallback(onV2CommandAck);
+  mesh::setV2CommandErrorCallback(onV2CommandError);
 }
 
 void applyPersistedStates() {
@@ -777,6 +784,145 @@ void onRemoteSensorDiscovered(
     logger::sensorsf("New remote sensor '%s' (type:%d, uid:%u)", c.name.c_str(), sensor_type, sensor_id);
   }
   mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+}
+
+// ========================================
+// PROTOCOL V2 CALLBACKS (Phase 3)
+// ========================================
+
+void onV2EntityAnnounce(
+  uint32_t remote_uid,
+  const char *remote_ip,
+  const qymera::protocol::v2::EntityAnnouncePayload &payload) {
+  using namespace qymera::protocol::v2;
+  // Match by stable entity_id first
+  int idx = findCalibByEntityId(payload.entity_id);
+  if (idx < 0) {
+    // Not found by entity_id; try legacy uid + device_uid match
+    for (int i = 0; i < MAX_SENSORS; i++) {
+      if (!calibrations[i].local && calibrations[i].device_uid == remote_uid &&
+          calibrations[i].uid == payload.entity_id) {  // legacy: entity_id == uid in v2
+        idx = i;
+        break;
+      }
+    }
+  }
+  bool is_new = false;
+  if (idx == -1) {
+    for (int i = 0; i < MAX_SENSORS; i++) {
+      if (calibrations[i].uid == 0) {
+        idx = i;
+        is_new = true;
+        break;
+      }
+    }
+  }
+  if (idx < 0) return;  // no free slot
+
+  auto &c = calibrations[idx];
+  c.local = false;
+  c.device_uid = remote_uid;
+  strncpy(c.device_ip, remote_ip, sizeof(c.device_ip) - 1);
+  c.device_ip[sizeof(c.device_ip) - 1] = '\0';
+  c.id = idx;
+  c.uid = payload.entity_id;  // V2: entity_id on wire
+  c.entity_id = payload.entity_id;
+  c.type = (SensorType)payload.type;
+  if (is_new) c.avail = 0;
+  c.state = (payload.capabilities & (uint8_t)qymera::model::EntityCapability::WRITE) ? false : true;  // actuator default OFF
+  c.last_update = millis();
+  c.fade = payload.fade;
+  c.persist = payload.persist;
+  c.pers_state = payload.pers_state;
+  c.pulse = payload.pulse;
+  c.pulse_ms = payload.pulse_ms;
+  c.min = payload.min;
+  c.max = payload.max;
+  c.correction = payload.correction;
+  c.avail = payload.avail;
+  if (payload.name[0]) {
+    c.name = payload.name;
+  } else if (c.name == "") {
+    char namebuf[32];
+    snprintf(namebuf, sizeof(namebuf), "Remote_%X_%u", remote_uid, payload.entity_id);
+    c.name = namebuf;
+  }
+  if (is_new) {
+    logger::sensorsf("V2 New remote entity '%s' (type:%d, entity_id:%08X)",
+                     c.name.c_str(), payload.type, payload.entity_id);
+  }
+  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+}
+
+void onV2StateUpdate(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::StateUpdatePayload &payload) {
+  int idx = findCalibByEntityId(payload.entity_id);
+  if (idx < 0) return;  // unknown entity
+  auto &c = calibrations[idx];
+  if (c.local) return;  // only update remotes
+  if (c.device_uid != remote_uid) return;  // not our device
+
+  c.state = payload.state;
+  c.value = (c.type == sensors::SENSOR_LUMI || c.type == sensors::SENSOR_TIME)
+              ? (float)payload.value
+              : ((float)payload.value / 0xFFFFFFFF) * (150.0f - (-50.0f)) + (-50.0f);
+  c.avail = payload.avail;
+  c.last_update = millis();
+  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+}
+
+void onV2Command(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandPayload &payload) {
+  // Find local actuator by entity_id
+  int idx = findCalibByEntityId(payload.entity_id);
+  if (idx < 0) {
+    // Not found - send ERROR
+    mesh::sendV2CommandError(remote_uid, "unknown",
+                             payload.entity_id, payload.entity_id,
+                             1, "Entity not found");
+    return;
+  }
+  auto &c = calibrations[idx];
+  if (!c.local) {
+    mesh::sendV2CommandError(remote_uid, "unknown",
+                             payload.entity_id, payload.entity_id,
+                             3, "Not local");
+    return;
+  }
+  // Check capability (only actuators are commandable)
+  if (qymera::model::capabilityOfType(payload.type) !=
+      qymera::model::EntityCapability::READ_WRITE) {
+    mesh::sendV2CommandError(remote_uid, "unknown",
+                             payload.entity_id, payload.entity_id,
+                             2, "Invalid type");
+    return;
+  }
+
+  // Execute command
+  if (payload.type == (uint8_t)sensors::TYPE_RELAY) {
+    setRelay(c.name, payload.state);
+  } else if (payload.type == (uint8_t)sensors::TYPE_DIMMER) {
+    handleDimmer(c.name, (int)payload.value);
+  }
+  // Send ACK with OK status
+  mesh::sendV2CommandAck(remote_uid, "unknown", payload.entity_id, payload.entity_id, 0);
+}
+
+void onV2CommandAck(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandAckPayload &payload) {
+  // Log ACK receipt; could track pending commands for retry logic
+  logger::coref("V2 Command ACK from %08X entity=%08X status=%d",
+                remote_uid, payload.entity_id, payload.status);
+}
+
+void onV2CommandError(
+  uint32_t remote_uid,
+  const qymera::protocol::v2::CommandErrorPayload &payload) {
+  logger::warnf("V2 Command ERROR from %08X entity=%08X code=%d: %s",
+                remote_uid, payload.entity_id, payload.error_code, payload.message);
 }
 
 }  // namespace sensors
