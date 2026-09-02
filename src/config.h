@@ -123,8 +123,14 @@ typedef WebServer WebServerCompat;
 #define EEPROM_OTA_HASH_ADDR  (EEPROM_RULES_START + EEPROM_RULES_SIZE)
 #define EEPROM_OTA_HASH_SIZE  4
 #define EEPROM_OTA_FLAG_ADDR  (EEPROM_OTA_HASH_ADDR + EEPROM_OTA_HASH_SIZE)
-#if (EEPROM_OTA_FLAG_ADDR + 1) > EEPROM_SIZE
-#error OTA integrity region overflow
+
+/* Entity ID map (slot_index -> entity_id), 4 bytes per slot.
+   Allows stable identity without shifting existing EEPROM layout. */
+#define EEPROM_ENTITY_ID_START  (EEPROM_OTA_FLAG_ADDR + 1)
+#define EEPROM_ENTITY_ID_SIZE   (MAX_PERSISTED_SENSORS * 4)
+
+#if (EEPROM_ENTITY_ID_START + EEPROM_ENTITY_ID_SIZE) > EEPROM_SIZE
+#error Entity ID map region overflow
 #endif
 
 /* =========================

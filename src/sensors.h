@@ -37,7 +37,8 @@ struct Calibration {
   bool inverted;
   String name;
   uint8_t id = 0;
-  uint32_t uid = 0;
+  uint32_t uid = 0;            // wire-protocol identity (index-derived, legacy)
+  uint32_t entity_id = 0;      // stable identity (persisted, NOT index-derived)
   bool local = true;
   char device_ip[16];
   uint32_t device_uid = 0;
@@ -89,6 +90,7 @@ void ensureTimeRegistered();
 extern int findCalib(const String &key);
 extern int findCalibByUid(uint32_t uid);
 extern int findCalibByIndex(uint8_t index);
+extern int findCalibByEntityId(uint32_t entity_id);
 // Remote-sensor lifecycle: stale remotes are hidden from the active API/UI and
 // their unreferenced slots are reclaimed so MAX_SENSORS cannot be exhausted.
 bool isValidSensorType(uint8_t type);

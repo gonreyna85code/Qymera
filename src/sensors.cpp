@@ -18,6 +18,25 @@ PulseState activePulses[MAX_SENSORS];
 
 static TimeSource time_source = TIME_NONE;
 
+// Simple PRNG for entity ID generation (xorshift32).
+static uint32_t entity_id_seed = 0;
+
+static uint32_t nextEntityId() {
+  if (entity_id_seed == 0) {
+    // Seed from chip ID + millis for variability across boots before persistence loads.
+    entity_id_seed = GET_CHIP_ID() ^ (uint32_t)millis();
+    entity_id_seed |= 1;  // ensure non-zero
+  }
+  // xorshift32
+  uint32_t x = entity_id_seed;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  entity_id_seed = x;
+  // Combine with chip ID upper bits for device-level uniqueness.
+  return (GET_CHIP_ID() & 0xFFFF0000) | (x & 0xFFFF);
+}
+
 static uint32_t makeSensorUid(uint8_t index) {
   return GET_CHIP_ID() + (uint32_t)index + 1;
 }
@@ -36,9 +55,15 @@ static void bindLocalSensor(uint8_t idx, const String &name, SensorType type) {
   c.uid = makeSensorUid(idx);
   c.type = type;
   c.local = true;
-   c.device_uid = GET_CHIP_ID();
-   IPAddress ip = WiFi.localIP();
-   snprintf(c.device_ip, sizeof(c.device_ip), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  c.device_uid = GET_CHIP_ID();
+  IPAddress ip = WiFi.localIP();
+  snprintf(c.device_ip, sizeof(c.device_ip), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  // Assign stable entity_id on first registration (persisted across reboots).
+  if (c.entity_id == 0) {
+    c.entity_id = nextEntityId();
+    logger::sensorsf("Entity registered: idx=%d uid=%u entity_id=%08X name=%s",
+                     idx, c.uid, c.entity_id, name.c_str());
+  }
 }
 
 // Local-only name lookup for the sensor read/registration functions. A name
@@ -185,6 +210,14 @@ int findCalibByUid(uint32_t uid) {
 int findCalibByIndex(uint8_t index) {
   if (index >= MAX_SENSORS) return -1;
   return calibrations[index].uid == 0 ? -1 : index;
+}
+
+int findCalibByEntityId(uint32_t entity_id) {
+  if (entity_id == 0) return -1;
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    if (calibrations[i].entity_id == entity_id) return i;
+  }
+  return -1;
 }
 
 void setRelay(const String &key, bool target) {

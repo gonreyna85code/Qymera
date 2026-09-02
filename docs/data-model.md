@@ -358,3 +358,58 @@ void setRelay(const String &key, bool target);
 - Migration from `uid = ChipID + index + 1` to stable `entity_id`.
 - Update discovery packets to carry stable `entity_id`.
 - Persistence schema version bump to carry `entity_id`.
+
+---
+
+## 10. Phase 2 Delivered (2026-08-31)
+
+**Scope**: Per professionalization roadmap Phase 2 — introduce stable `entity_id` decoupled from runtime array index, with persistence and migration. The legacy `uid` (wire-protocol identity) is preserved for backward compatibility on the wire.
+
+### Delivered
+
+| Artifact | Purpose |
+|----------|---------|
+| `sensors.h` | Added `uint32_t entity_id = 0;` to `Calibration` struct (stable identity, NOT index-derived). |
+| `sensors.cpp` | `nextEntityId()` xorshift32 PRNG (seeded from chip_id + millis), `bindLocalSensor()` assigns `entity_id` once on first registration, `findCalibByEntityId()` lookup helper. |
+| `config.h` | New EEPROM region `EEPROM_ENTITY_ID_START` / `EEPROM_ENTITY_ID_SIZE` (40 slots × 4 bytes = 160 bytes) for slot_index → entity_id map. **No existing EEPROM layout changed**. |
+| `storage.cpp` | `CALIB_VERSION` bumped to 2. `loadEntityId()` / `saveEntityId()` helpers. `loadCalibration()` restores `entity_id` from map. `saveCalibrationSlot()` persists `entity_id` to map. Migration: v1 slots (no entity_id map entry) get new `entity_id` on next registration; v2 slots retain stable ID. |
+| `tests/host_sanity.py` | +15 tests: xorshift32 deterministic sequence, entity_id properties (non-zero, chip-specific, unique), `findCalibByEntityId` logic, `bindLocalSensor` idempotency. Host tests: **86/86 PASS** (71 baseline + 15 new). |
+| Build matrix | All 3 environments PASS. Memory: +~256 bytes RAM (64 slots × 4 bytes entity_id). ESP8266 70.0% / 42.3%; ESP32 22.7% / 73.8%; ESP32-C3 21.0% / 72.8%. |
+
+### Rationale
+
+- **Zero layout disruption**: Entity ID map uses previously unused EEPROM space after OTA flag. Existing devices boot without factory reset — v1 slots migrate lazily on next registration.
+- **Stable identity**: `entity_id` generated once on first registration, persisted, survives slot reclamation/reordering. `uid` remains for wire protocol (Phase 3 Protocol V2 will carry `entity_id` on the wire).
+- **Device-scoped uniqueness**: Upper 16 bits = chip_id upper 16 bits; lower 16 bits = xorshift32 sequence. Collisions across devices extremely unlikely.
+- **Idempotent assignment**: `bindLocalSensor()` only sets `entity_id` if zero — survives reboots and re-registration of same slot.
+
+### Migration Strategy (Legacy UID → Entity ID)
+
+| Scenario | Behavior |
+|----------|----------|
+| Existing device (v1 persist, no entity_id map) | On boot: `loadCalibration()` finds no map entry → `entity_id` stays 0. On next `bindLocalSensor()` call (or new registration): `entity_id` generated, persisted to map. |
+| New registration | `entity_id` generated immediately, persisted to map. |
+| Slot reclaimed & re-registered | New `entity_id` generated (correct: it's a different logical entity). |
+| Remote entities | `entity_id` not applicable (owned by another device); `device_uid` + `uid` used for wire identity. Phase 3 will propagate owner's `entity_id` in discovery. |
+
+### Open Questions (Updated)
+
+1. **String vs Fixed-Char for names**: `String` (heap) vs `char[32]` (stack/EEPROM)
+2. **Rule migration**: How to handle existing EEPROM rules referencing old indices? (Phase 3+)
+3. **Remote entity ID stability**: Owner's `entity_id` must be known to remotes → include in discovery packets (Phase 3 Protocol V2)
+4. **Entity ID collision handling**: Theoretical; xorshift32 + chip_id bits make it negligible. Document only.
+
+---
+
+## 11. Validation Checklist for Phase 2 Completion
+
+- [x] `entity_id` field added to `Calibration`
+- [x] Stable generation (`nextEntityId` xorshift32)
+- [x] Assignment on first registration (`bindLocalSensor`)
+- [x] Lookup helper (`findCalibByEntityId`)
+- [x] Persistence (separate EEPROM map, no layout shift)
+- [x] Migration v1→v2 (lazy on next registration)
+- [x] Build passes 3/3 environments
+- [x] Host tests pass (86/86)
+- [x] No wire protocol changes (uid preserved)
+- [x] No factory reset required for existing devices

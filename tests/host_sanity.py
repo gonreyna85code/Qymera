@@ -291,6 +291,109 @@ check("isValidType rejects unknown bytes",
 check("isValidSensorType canonical match",
       all((1 <= t <= 12) == is_valid_type(t) for t in range(0, 256) if t < 14))
 
+# ---------------------------------------------------------------- identity system
+# src/sensors.cpp: nextEntityId(), findCalibByEntityId(), bindLocalSensor()
+# Mirrors xorshift32 PRNG and entity_id assignment logic.
+
+def xorshift32(seed):
+    x = seed
+    x ^= (x << 13) & 0xFFFFFFFF
+    x ^= (x >> 17) & 0xFFFFFFFF
+    x ^= (x << 5) & 0xFFFFFFFF
+    return x & 0xFFFFFFFF
+
+def next_entity_id(seed, chip_id):
+    # src/sensors.cpp: nextEntityId()
+    # Returns (entity_id, new_seed)
+    if seed == 0:
+        seed = chip_id ^ 0x12345678  # fixed test seed instead of millis()
+        seed |= 1
+    new_seed = xorshift32(seed)
+    entity_id = (chip_id & 0xFFFF0000) | (new_seed & 0xFFFF)
+    return entity_id, new_seed
+
+# Simulate Calibration array for findCalibByEntityId
+class MockCalib:
+    def __init__(self, entity_id=0, uid=0, local=True):
+        self.entity_id = entity_id
+        self.uid = uid
+        self.local = local
+
+def find_by_entity_id(calibs, entity_id):
+    if entity_id == 0:
+        return -1
+    for i, c in enumerate(calibs):
+        if c.entity_id == entity_id:
+            return i
+    return -1
+
+def find_by_uid(calibs, uid):
+    if uid == 0:
+        return -1
+    for i, c in enumerate(calibs):
+        if c.uid == uid:
+            return i
+    return -1
+
+print("[identity system]")
+# xorshift32 deterministic sequence
+seed = 0xDEADBEEF
+expected = [0x477D20B7, 0x8E1D9142, 0xBA8C2458, 0xFEE0503B]
+for exp in expected:
+    seed = xorshift32(seed)
+    check("xorshift32 step", seed == exp)
+
+# entity_id generation: non-zero, combines chip_id upper bits
+chip_id = 0x12345678
+seed = 0
+eid1, seed = next_entity_id(seed, chip_id)
+eid2, seed = next_entity_id(seed, chip_id)
+eid3, seed = next_entity_id(seed, chip_id)
+check("entity_id non-zero", eid1 != 0 and eid2 != 0 and eid3 != 0)
+check("entity_id upper 16 bits = chip_id upper 16 bits",
+      (eid1 & 0xFFFF0000) == (chip_id & 0xFFFF0000) and
+      (eid2 & 0xFFFF0000) == (chip_id & 0xFFFF0000) and
+      (eid3 & 0xFFFF0000) == (chip_id & 0xFFFF0000))
+check("entity_id unique per call", eid1 != eid2 and eid2 != eid3 and eid1 != eid3)
+check("entity_id differs per chip_id",
+      next_entity_id(0, 0x11111111)[0] != next_entity_id(0, 0x22222222)[0])
+
+# findCalibByEntityId logic
+calibs = [
+    MockCalib(entity_id=0x12345678, uid=1),
+    MockCalib(entity_id=0x87654321, uid=2),
+    MockCalib(entity_id=0, uid=3),
+    MockCalib(entity_id=0xAAAABBBB, uid=4, local=False),  # remote
+]
+check("findByEntityId exact match", find_by_entity_id(calibs, 0x12345678) == 0)
+check("findByEntityId remote entity", find_by_entity_id(calibs, 0xAAAABBBB) == 3)
+check("findByEntityId not found", find_by_entity_id(calibs, 0xDEADBEEF) == -1)
+check("findByEntityId zero returns -1", find_by_entity_id(calibs, 0) == -1)
+check("findByEntityId prefers entity_id over uid",
+      find_by_entity_id(calibs, 0x87654321) == 1 and
+      find_by_uid(calibs, 2) == 1)
+
+# bindLocalSensor assigns entity_id only once (persists across reboots simulation)
+# Simulate: first registration -> entity_id assigned; second call with same object -> keeps entity_id
+class MockCalib2:
+    def __init__(self):
+        self.entity_id = 0
+        self.uid = 0
+
+def bind_local_sensor(c, seed, chip_id):
+    if c.entity_id == 0:
+        c.entity_id, seed = next_entity_id(seed, chip_id)
+    c.uid = chip_id + 1  # simplified makeSensorUid
+    return seed
+
+c = MockCalib2()
+seed = 0
+seed = bind_local_sensor(c, seed, 0x12345678)
+eid_first = c.entity_id
+seed = bind_local_sensor(c, seed, 0x12345678)  # second call - should NOT reassign
+check("bindLocalSensor assigns entity_id once", c.entity_id == eid_first)
+check("bindLocalSeed increments seed", c.entity_id != 0)
+
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)

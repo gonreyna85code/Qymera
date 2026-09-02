@@ -53,15 +53,15 @@ void clearAll() {
 #endif
 
 /* Persisted calibration slot.
-   magic/version validate the slot is provisioned and current; uid ties the
-   slot to the registered device so persistence survives index reordering. */
+   v1: magic/version/uid/... (legacy)
+   v2: entity_id stored in separate map (see EEPROM_ENTITY_ID_START) */
 static const uint32_t CALIB_MAGIC = 0x514D434C;  // "QMCL"
-static const uint16_t CALIB_VERSION = 1;
+static const uint16_t CALIB_VERSION = 2;
 
 struct __attribute__((packed)) CalibrationPersist {
   uint32_t magic;
   uint16_t version;
-  uint32_t uid;
+  uint32_t uid;              // legacy wire identity
   bool pers_state;
   float min;
   float max;
@@ -83,6 +83,32 @@ struct RulesHeader {
 
 static const uint32_t RULES_MAGIC = 0x4155544F;  // "AUTO"
 static const uint16_t RULES_VERSION = 1;
+
+// Entity ID map helpers (slot_index -> entity_id)
+static inline int entityIdMapAddr(int slot) {
+  return EEPROM_ENTITY_ID_START + slot * 4;
+}
+static uint32_t loadEntityId(int slot) {
+  uint32_t eid = 0;
+  int addr = entityIdMapAddr(slot);
+#if defined(ESP32)
+  begin();
+  prefs.getBytes(String(addr).c_str(), &eid, 4);
+#else
+  EEPROM.get(addr, eid);
+#endif
+  return eid;
+}
+static void saveEntityId(int slot, uint32_t entity_id) {
+  int addr = entityIdMapAddr(slot);
+#if defined(ESP32)
+  begin();
+  prefs.putBytes(String(addr).c_str(), &entity_id, 4);
+#else
+  EEPROM.put(addr, entity_id);
+  EEPROM.commit();
+#endif
+}
 
 static const uint32_t OTA_HASH_BYTES = 256;
 static bool ota_integrity_verified = false;
@@ -232,6 +258,11 @@ void loadCalibration() {
     c.pulse = p.pulse;
     c.pulse_ms = p.pulse_ms;
     c.fade = p.fade;
+    // Restore stable entity_id from map (v2+)
+    uint32_t eid = loadEntityId(i);
+    if (eid != 0) {
+      c.entity_id = eid;
+    }
   }
 }
 
@@ -254,6 +285,10 @@ void saveCalibrationSlot(int index) {
     current.pulse = c.pulse;
     current.pulse_ms = c.pulse_ms;
     current.fade = c.fade;
+    // Persist stable entity_id in separate map
+    if (c.entity_id != 0) {
+      saveEntityId(index, c.entity_id);
+    }
   }
   CalibrationPersist stored = {};
   get(addr, stored);
