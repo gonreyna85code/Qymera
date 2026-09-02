@@ -212,6 +212,85 @@ check("after wrap drain, count==0", f.count == 0)
 f.enqueue(b"z")
 check("reusable after full cycle", f.recv() == b"z" and f.count == 0)
 
+# ---------------------------------------------------------------- entity model
+# src/model.h: qymera::model classification (pure, host-testable).
+# SensorType enum VALUES (src/sensors.h):
+#   0 NONE, 1 LUMI, 2 HUMI, 3 TEMP, 4 PRESS, 5 LEVEL, 6 AIRQ, 7 RAIN,
+#   8 TYPE_DIMMER, 9 TYPE_RELAY, 10 SENSOR_TIME, 11 GENERIC, 12 CONTACT
+NONE = 0
+SENSOR = 1
+ACTUATOR = 2
+CLOCK = 3
+
+_SENSOR_TYPES = {1, 2, 3, 4, 5, 6, 7, 11, 12}
+_ACTUATOR_TYPES = {8, 9}
+_CLOCK_TYPES = {10}
+
+
+def kind_of_type(t):
+    if t == 8 or t == 9:
+        return ACTUATOR
+    if t == 10:
+        return CLOCK
+    if t in _SENSOR_TYPES:
+        return SENSOR
+    return NONE
+
+
+def capability_of_type(t):
+    k = kind_of_type(t)
+    if k == ACTUATOR:
+        return 3  # READ_WRITE
+    if k == SENSOR or k == CLOCK:
+        return 1  # READ
+    return 0  # NONE
+
+
+def ownership_of(local, uid):
+    if uid == 0:
+        return 0  # NONE
+    return 1 if local else 2  # LOCAL / REMOTE
+
+
+def is_valid_type(t):
+    return kind_of_type(t) != NONE
+
+
+print("[entity model]")
+for t in range(0, 13):
+    check("type %d kind" % t,
+          kind_of_type(t) ==
+          (ACTUATOR if t in _ACTUATOR_TYPES else
+           CLOCK if t in _CLOCK_TYPES else
+           SENSOR if t in _SENSOR_TYPES else NONE))
+check("kind NONE type == 0", kind_of_type(0) == NONE)
+check("kind ACTUATOR dimmer==8 relay==9",
+      kind_of_type(8) == ACTUATOR and kind_of_type(9) == ACTUATOR)
+check("kind CLOCK time==10", kind_of_type(10) == CLOCK)
+check("kind SENSOR generics",
+      all(kind_of_type(t) == SENSOR for t in [1, 2, 3, 4, 5, 6, 7, 11, 12]))
+check("invalid raw byte -> NONE",
+      kind_of_type(13) == NONE and kind_of_type(200) == NONE and
+      kind_of_type(255) == NONE)
+cap = {t: capability_of_type(t) for t in range(0, 13)}
+check("capability READ_WRITE only actuators",
+      all(cap[t] == 3 for t in [8, 9]))
+check("capability READ for sensor+clock",
+      all(cap[t] == 1 for t in [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]))
+check("capability NONE for empty/invalid", cap[0] == 0 and
+      capability_of_type(13) == 0)
+check("ownership uid==0 -> NONE",
+      ownership_of(True, 0) == 0 and ownership_of(False, 0) == 0)
+check("ownership local/remote",
+      ownership_of(True, 5) == 1 and ownership_of(False, 5) == 2)
+check("isValidType==legacy range[1..12]",
+      all(is_valid_type(t) == (1 <= t <= 12) for t in range(0, 16)))
+check("isValidType rejects unknown bytes",
+      not is_valid_type(13) and not is_valid_type(255))
+# canonical equivalence used by sensors.cpp:isValidSensorType()
+check("isValidSensorType canonical match",
+      all((1 <= t <= 12) == is_valid_type(t) for t in range(0, 256) if t < 14))
+
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)

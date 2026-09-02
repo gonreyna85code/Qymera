@@ -329,3 +329,32 @@ void setRelay(const String &key, bool target);
 2. **Entity ID generation**: Random UUID vs `ChipID + counter` vs hash of `(device_id, name)`
 3. **Rule migration**: How to handle existing EEPROM rules referencing old indices?
 4. **Remote entity ID stability**: Owner's `entity_id` must be known to remotes → include in discovery packets
+
+---
+
+## 9. Phase 1 Delivered (2026-08-31)
+
+**Scope**: Per professionalization roadmap Phase 1 — introduce explicit Entity Model vocabulary *without* a destructive rewrite. The monolithic `Calibration` struct remains the storage/transport representation; a new pure-C++ classification layer (`src/model.h`) provides the conceptual vocabulary.
+
+### Delivered
+
+| Artifact | Purpose |
+|----------|---------|
+| `src/model.h` | Pure C++ header (no Arduino deps) declaring: `EntityKind` (SENSOR/ACTUATOR/CLOCK/NONE), `EntityCapability` (READ/WRITE/READ_WRITE/NONE), `EntityOwnership` (OWNER_LOCAL/REMOTE/NONE), `EntityIdentity`, `EntityConfig`, `EntityState` structs (documented PODs for future phases), and constexpr classification functions: `kindOfType()`, `capabilityOfType()`, `ownershipOf()`, `isValidType()`. |
+| `sensors.cpp` | `isValidSensorType()` now delegates to `qymera::model::isValidType()` (behavior identical: types 1..12 valid). Remote command handler guards with `capabilityOfType(command_type) == READ_WRITE` — documents that only actuators are commandable; behavior unchanged. |
+| `tests/host_sanity.py` | +26 tests mirroring the model.h classification table: kindOfType for all 0..12 + invalid, capabilityOfType, ownershipOf, isValidType equivalence to legacy range. Host tests: **71/71 PASS** (45 baseline + 26 new). |
+| Build matrix | All 3 environments PASS. Memory footprint **identical to baseline**: ESP8266 69.6% RAM / 42.2% Flash; ESP32 22.6% / 73.7%; ESP32-C3 20.9% / 72.8%. Zero RAM overhead (header-only constexpr). |
+
+### Rationale
+
+- **No new arrays/state** → zero memory cost, no migration risk.
+- **Pure C++** → host-testable in Python mirror; usable by any module without pulling Arduino.h.
+- **Canonical `isValidSensorType`** now single-sourced from model.h — eliminates drift.
+- **Capability guard** on commands makes intent explicit (actuators only) while preserving exact behavior.
+
+### Next (Phase 2: Identity System)
+
+- Stable entity ID generation (`entity_id` independent of runtime slot index).
+- Migration from `uid = ChipID + index + 1` to stable `entity_id`.
+- Update discovery packets to carry stable `entity_id`.
+- Persistence schema version bump to carry `entity_id`.

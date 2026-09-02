@@ -2,6 +2,7 @@
 #include <WiFiClient.h>
 #include <time.h>
 #include "config.h"
+#include "model.h"
 #include "core.h"
 #include "mesh.h"
 #include "web.h"
@@ -80,7 +81,9 @@ void applyPersistedStates() {
 // ================= REMOTE SENSOR LIFECYCLE =================
 
 bool isValidSensorType(uint8_t type) {
-  return type > SENSOR_NONE && type <= SENSOR_CONTACT;
+  // Canonical entity-model definition: a type is valid iff it maps to a real
+  // entity kind (sensor / actuator / clock). Mirrors qymera::model::isValidType.
+  return qymera::model::isValidType(type);
 }
 
 bool isStaleRemote(int index) {
@@ -632,6 +635,12 @@ void onRemoteCommand(
   if (idx < 0) return;
   auto &c = calibrations[idx];
   if (!c.local) return;  // sólo actuamos sobre sensores propios
+
+  // Only READ_WRITE entities (actuators: relay / dimmer) are commandable.
+  if (qymera::model::capabilityOfType(command_type) !=
+      qymera::model::EntityCapability::READ_WRITE) {
+    return;
+  }
 
   if (command_type == (uint8_t)TYPE_RELAY) {
     setRelay(c.name, state);
