@@ -34,7 +34,7 @@ src/
 ├── log.h/cpp         # Layered logging, UDP broadcast, remote log ingest
 ├── espnow_p2p.cpp    # ESP-NOW RX FIFO (bounded ring buffer)
 ├── html.cpp          # Embedded GUI (single-page app, ~70KB compressed)
-└── main.cpp          # Sketch entry point (Qymera::begin/loop + hooks)
+└── main.ino          # PlatformIO sketch entry (ignored by Arduino IDE lib build)
 ```
 
 ---

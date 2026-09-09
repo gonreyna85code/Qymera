@@ -12,7 +12,7 @@ in `src/`.
 | File | Purpose | Owner | Status |
 |------|---------|-------|--------|
 | `Qymera.h` | Master library header for Arduino IDE sketches; public `Qymera::` facade (lifecycle, sensors, actuators, serial control) forwarding to core/sensors | Core team | ✅ Up to date |
-| `main.cpp` | PlatformIO entry point: `setup()`/`loop()` delegate to `Qymera::begin()`/`Qymera::loop()`; provides hooks `Qymera::init()`/`Qymera::report()`/`Qymera::onCommand()` | Platform team | ✅ Working |
+| `main.ino` | PlatformIO sketch entry point: `setup()`/`loop()` delegate to `Qymera::begin()`/`Qymera::loop()`; provides hooks `Qymera::init()`/`Qymera::report()`/`Qymera::onCommand()`. `.ino` extension so the Arduino IDE library build ignores it (no duplicate symbols with user sketch) | Platform team | ✅ Working |
 | `config.h` | Platform auto-detection (ESP8266/ESP32/S2/S3/C3), system limits, EEPROM layout offsets, PWM abstraction, network defaults | Platform team | ✅ Up to date |
 | `core.cpp` | MCU init, WiFi, OTA lifecycle, per-`report()` loop scaffolding, memory reporting | Core team | ✅ Working |
 | `core.h` | Core class definition, OTA control | Core team | ✅ Up to date |
@@ -119,7 +119,7 @@ in `src/`.
 ## Build Verification
 
 ```bash
-pio run -e esp8266_generic   # ESP8266 (full link, main.cpp provides setup/loop)
+pio run -e esp8266_generic   # ESP8266 (full link, main.ino provides setup/loop)
 pio run -e esp32_devkit      # ESP32
 pio run -e esp32c3_devkit    # ESP32-C3 (build-verified)
 pio run                      # all platforms
@@ -127,7 +127,7 @@ python tests/host_sanity.py  # host suite (45/45)
 ```
 
 Expected: full-link SUCCESS on all three envs (this repo builds
-`src/main.cpp`, which provides `setup()`/`loop()`). Typical footprints
+`src/main.ino`, which provides `setup()`/`loop()`). Typical footprints
 (2026-08-27): ESP8266 RAM 69.6% / Flash 42.2%; ESP32 RAM 22.6% / Flash 73.7%;
 ESP32-C3 RAM 20.9% / Flash 72.8%.
 

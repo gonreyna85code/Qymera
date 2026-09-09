@@ -55,7 +55,9 @@ lib_deps =
 ### 3. Create Your First Sketch
 
 Use the built-in [Base example](examples/Base/Base.ino) as a starting point
-(`main.cpp` is the PlatformIO entry point). The library handles WiFi, the web
+(`src/main.ino` is the PlatformIO sketch entry point; its `.ino` extension
+is what keeps the Arduino IDE library build from compiling it, avoiding
+duplicate symbols with your sketch). The library handles WiFi, the web
 server, UDP mesh, and automation logic — your sketch only needs to implement
 three hooks under the `Qymera` namespace:
 

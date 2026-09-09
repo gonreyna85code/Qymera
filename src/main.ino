@@ -1,9 +1,14 @@
 /*
-  Base - Minimal Qymera Example (PlatformIO src/main.cpp)
-  =======================================================
+  Base - Minimal Qymera Example (PlatformIO sketch: src/main.ino)
+  ==============================================================
 
-  The user sketch only needs to implement three hooks under the Qymera
-  namespace:
+  This file is the PLATFORMIO sketch entry point only. It intentionally
+  uses the .ino extension so the Arduino IDE library build (which compiles
+  only .c/.cpp sources under the library's src/) ignores it, avoiding
+  duplicate symbols with the user sketch.
+
+  The user sketch (e.g. examples/Base/Base.ino) only needs to implement
+  three hooks under the Qymera namespace:
     1. Qymera::init()    - initialize hardware libraries (Wire, etc.)
     2. Qymera::report()  - read hardware and report values via Qymera::xxx()
     3. Qymera::onCommand() - custom logic for received commands
