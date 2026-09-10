@@ -209,3 +209,30 @@ core::loop()  [runs continuously]
 | Max rules | 20 |
 | Mesh timeout | `MESH_TIMEOUT` (default 30s) |
 | OTA integrity | Chip-ID provisioning (not full hash) |
+
+---
+
+## 11. ESP8266 OTA Flash-Config Gate
+
+ESP8266 Arduino core (2.4.x and 3.x) makes `Update.begin()` (used by ArduinoOTA,
+started in `core.cpp`) enforce `ESP.checkFlashConfig(false)`: the flash capacity
+encoded in the **boot header at flash address `0x0000`** must be `<=` the real
+chip size (`spi_flash_get_id()`). On mismatch, every network update is rejected
+with `UPDATE_ERROR_FLASH_CONFIG` (8) — surfaced by `espota.py` as
+`Bad Answer: ERR: ERROR[8]: Flash config wrong: real: ..., SDK: ...`.
+
+- `real` = physical flash (e.g. 1,048,576 = 1 MB).
+- `SDK` = flash-size nibble read from the image header at `0x0000` written by the
+  **last serial flash** (`Esp.cpp` `getFlashChipSize()`/`magicFlashChipSize()`),
+  **not** the currently running sketch. OTA never rewrites `0x0000`, so the
+  Arduino IDE *Flash Size* menu cannot affect a device that has a stale 4 MB
+  header.
+- Serial uploads that pass `--flash_size detect` (current ESP8266 core, 3.x)
+  rewrite the header to the real size and repair the gate. Serial uploads that
+  keep a 4 MB compile-time header (PlatformIO `esp12e` + esptool `keep`, since
+  `espressif8266` invokes `write_flash 0x0 <bin>` without `--flash_size`)
+  re-introduce the mismatch on 1 MB hardware.
+- This repo pins `[env:esp8266_generic]` to the 1 MB layout
+  (`board_build.ldscript = eagle.flash.1m64.ld`) so PIO serial flashes write a
+  1 MB header (verified: `firmware.bin` header nibble `0x2`). Use
+  `eagle.flash.4m1m.ld` only when the node really has 4 MB.

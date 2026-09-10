@@ -284,6 +284,19 @@ firewall; use a VPN for remote access.
 - Verify pin assignments match your hardware
 - Remote entities only appear while their owner announces (< ~30 s — `MESH_TIMEOUT`)
 
+**ESP8266: OTA fails with `Bad Answer: ERR: ERROR[8]: Flash config wrong: real: 1048576, SDK: 4194304`?**
+- ESP8266 `Update.begin()` refuses a network (OTA) update when the flash-size nibble
+  stored in the boot header at flash address `0x0000` says **4 MB** but the chip
+  actually has **1 MB**. The `SDK:` value comes from that stale boot header — it is
+  **not** the currently compiled sketch (the shipped default build already encodes
+  1 MB). OTA never rewrites address `0x0000`, so changing the Arduino IDE *Flash
+  Size* menu alone cannot fix it.
+- Fix (once, over USB): re-flash the device over **serial** with the current
+  ESP8266 core — its uploader passes `--flash_size detect`, which rewrites the boot
+  header to the real 1 MB size and re-enables OTA. The PlatformIO `esp8266_generic`
+  env in this repo is pinned to the 1 MB layout (`board_build.ldscript =
+  eagle.flash.1m64.ld`) so its serial flashes stay consistent with 1 MB hardware.
+
 ---
 
 ## Advanced Configuration
