@@ -431,10 +431,102 @@ struct Envelope {
 
 ### Next (Phase 4: Command Delivery Semantics)
 
-- Reliable command delivery: retry with exponential backoff
-- Duplicate detection (msg_id tracking)
-- Timeout and retransmission logic
-- Pending command queue per peer
+- ✅ **Delivered** — see [§11 Phase 4](#11-phase-4-command-delivery-semantics) below.
+
+---
+
+## 11. Phase 4: Command Delivery Semantics
+
+**Date:** 2026-09-09  
+**Scope:** Turn `COMMAND`/`COMMAND_ACK`/`COMMAND_ERROR` from best-effort into a reliable delivery channel: bounded pending-command queue, exponential-backoff retransmission, per-peer duplicate suppression, and TTL-based timeout. Pure C++ reliability core in `src/cmd_delivery.h` (host-testable, no Arduino deps).
+
+### 11.1 Reliability Contract
+
+Only `COMMAND` is treated as **reliable** at the transport layer. Everything else remains best effort:
+
+| Message Type | Semantics | Implemented by |
+|--------------|-----------|----------------|
+| `COMMAND` (ACK_REQ) | **Reliable** — queue + retry + TTL | `ReliableQueue` + `dual-hop ACK` |
+| `COMMAND_ACK` | Best effort (correlates to a queued command) | `ReliableQueue.onAck()` |
+| `COMMAND_ERROR` | Cancels the pending retry loop | `ReliableQueue.onError()` |
+| `HELLO` / `ENTITY_ANNOUNCE` / `STATE_UPDATE` / `LOG` | Best effort | periodic/event senders |
+
+The wire ACK/ERROR already carries the original `msg_id`, so correlation works without extra framing.
+
+### 11.2 Outbound: Pending Command Queue (`ReliableQueue`)
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `MAX_PENDING` | 6 | Queue depth (bounded, fixed slots) |
+| `MAX_RETRIES` | 3 | Retransmissions after the first send (4 sends total) |
+| `BASE_RETRY_MS` | 2000 | First retry delay |
+| `RETRY_BACKOFF` | 2 | Delay multiplier per attempt |
+| `COMMAND_TTL_MS` | 30000 | Total time-to-live; dropped after expiry |
+
+Retry schedule: **2 s → 4 s → 8 s** (≈14 s of retransmissions), then it waits on the TTL (30 s) before being dropped and logged.
+
+State machine (driven from `mesh::tick()`, i.e. the main loop):
+
+1. `sendReliableV2Command()` → builds `COMMAND` with `ACK_REQ`, sends it once, `enqueue()`s `{msg_id, remote_uid, entity_id, ...}` with `attempts=1`, `next_retry=now+2 s`, `expires=now+30 s`.
+2. If the peer's `COMMAND_ACK` (or `COMMAND_ERROR`) arrives, `onAck`/`onError` frees the slot. The `COMMAND_ACK` callback is still invoked for observability.
+3. If no ACK by `next_retry`, `deliveryTick()` **re-sends the frame reusing the original `msg_id`** (never a fresh id) and schedules the next attempt with backoff.
+4. After `MAX_RETRIES` the command stops being resent; it stays queued until the TTL fires, then it decays with a warning log.
+
+Queue-full: the reliable sender refuses (returns false) and logs — no unbounded memory growth.
+
+### 11.3 Inbound: Duplicate Suppression (`DupRing`)
+
+Retransmissions reuse the original `msg_id`, so the receiver must not execute an actuator twice.
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `DUP_RING_SIZE` | 12 | Slots (fixed ring) |
+| `DUP_WINDOW_MS` | 20000 | Dedup retention ≥ retry schedule (14 s) + margin |
+
+On inbound `COMMAND` (dispatch in `parseBuffer`):
+
+- Not seen within the window → run the handler **once**, then `record(src, msg_id, status)`, respond `COMMAND_ACK`/`COMMAND_ERROR` with the handler status.
+- Seen within the window → **no re-execution**; reply with the **stored status** from the ring.
+
+> Note: against the design goal, dedup is per-device (not per-peer ring); a single ring over all senders is a bounded approximation. It is safe because `msg_id` is monotonic per sender and the window only spans retries of the same command.
+
+### 11.4 Handler Contract
+
+`V2CommandCallback` now **returns** an ACK status code and the transport owns the response:
+
+```cpp
+typedef uint8_t (*V2CommandCallback)(
+  uint32_t remote_uid, const char *remote_ip, uint32_t msg_id,
+  const CommandPayload &payload);
+```
+
+Status codes match `CommandAckPayload.status`:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | `ST_OK` | Executed → `COMMAND_ACK` |
+| 1 | `ST_NOT_FOUND` | No local entity with that `entity_id` → `COMMAND_ERROR` |
+| 2 | `ST_INVALID` | Type not commandable / unknown → `COMMAND_ERROR` |
+| 3 | `ST_NOT_LOCAL` | Entity exists but not owned locally → `COMMAND_ERROR` |
+| 4 | `ST_BUSY` | Reserved for future busy handling → `COMMAND_ERROR` |
+
+This also removes the Phase 3 double-ACK bug: the handler no longer sends its own ACK, and there is only one response per originating `msg_id`.
+
+### 11.5 Where Commands Are Sent Reliably
+
+- `sensors::setRelay()` / `sensors::handleDimmer()` remote branch → `mesh::sendReliableV2Command()` when the target has a V2 `entity_id`, legacy `mesh::sendCommand()` otherwise (legacy-only peers).
+- `mesh::sendV2Command(..., ack_requested=true)` now delegates to the reliable path.
+- Periodic `sendV2Hello()` + per-entity `sendV2EntityAnnounce()` (drove from `core.cpp` report block) are what give remotes a V2 `entity_id` in the first place.
+
+### 11.6 Compatibility
+
+| Aspect | Status |
+|--------|--------|
+| Legacy v1-v5 | **Unchanged** — legacy path and packet format untouched |
+| Existing V2 frames | **Unchanged** — same `COMMAND`/`COMMAND_ACK`/`COMMAND_ERROR` wire format |
+| Phase 3 handlers | Behavior preserved; handler signature extended (returns status; transport ACKs) |
+| Host tests | **Extended** — 138/138 PASS (102 + 36 new command-delivery tests) |
+| Firmware build | PlatformIO 3/3 + Arduino IDE reference builds |
 
 ---
 

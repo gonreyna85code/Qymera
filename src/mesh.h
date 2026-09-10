@@ -67,8 +67,12 @@ typedef void (*V2StateUpdateCallback)(
   uint32_t remote_uid,
   const qymera::protocol::v2::StateUpdatePayload &payload);
 
-typedef void (*V2CommandCallback)(
+// Returns an ACK status code (0 = OK; see qymera::delivery::AckStatus).
+// The transport layer sends COMMAND_ACK/COMMAND_ERROR on behalf of the handler.
+typedef uint8_t (*V2CommandCallback)(
   uint32_t remote_uid,
+  const char *remote_ip,
+  uint32_t msg_id,
   const qymera::protocol::v2::CommandPayload &payload);
 
 typedef void (*V2CommandAckCallback)(
@@ -229,6 +233,14 @@ void sendV2StateUpdate(uint8_t index);
 void sendV2Command(uint32_t remote_uid, const char *remote_ip,
                    uint32_t entity_id, uint8_t type, uint32_t value, bool state,
                    bool ack_requested = true);
+
+// V2 Command Delivery Semantics (Phase 4): sends a COMMAND with ACK_REQ and
+// tracks it until COMMAND_ACK/COMMAND_ERROR or timeout, retrying with
+// exponential backoff from mesh::tick(). Returns false if not queued (queue
+// full or unknown remote).
+bool sendReliableV2Command(uint32_t remote_uid, const char *remote_ip,
+                           uint32_t entity_id, uint8_t type, uint32_t value,
+                           bool state);
 void sendV2CommandAck(uint32_t remote_uid, const char *remote_ip,
                       uint32_t msg_id, uint32_t entity_id, uint8_t status);
 void sendV2CommandError(uint32_t remote_uid, const char *remote_ip,

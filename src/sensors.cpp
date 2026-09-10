@@ -8,6 +8,7 @@
 #include "web.h"
 #include "automations.h"
 #include "log.h"
+#include "cmd_delivery.h"
 
 
 namespace sensors {
@@ -234,14 +235,18 @@ void setRelay(const String &key, bool target) {
   if (c.type != TYPE_RELAY) return;
 
   if (!c.local) {
-    // ---- Actuador REMOTO: enviar comando UDP al dispositivo propietario ----
-    mesh::sendCommand(
-      c.device_uid,
-      c.device_ip,
-      c.uid,
-      (uint8_t)TYPE_RELAY,
-      target ? 1u : 0u,
-      target);
+    // ---- Actuador REMOTO: ----
+    // V2-discovered remotes (stable entity_id) get reliable delivery (ACK +
+    // retry + timeout). Legacy-only remotes keep the best-effort legacy path.
+    if (c.entity_id != 0) {
+      mesh::sendReliableV2Command(
+        c.device_uid, c.device_ip, c.entity_id,
+        (uint8_t)TYPE_RELAY, target ? 1u : 0u, target);
+    } else {
+      mesh::sendCommand(
+        c.device_uid, c.device_ip, c.uid,
+        (uint8_t)TYPE_RELAY, target ? 1u : 0u, target);
+    }
     return;
   }
 
@@ -290,14 +295,18 @@ void handleDimmer(const String &key, int value) {
   value = constrain(value, 0, 100);
 
   if (!c.local) {
-    // ---- Actuador REMOTO: enviar comando UDP ----
-    mesh::sendCommand(
-      c.device_uid,
-      c.device_ip,
-      c.uid,
-      (uint8_t)TYPE_DIMMER,
-      (uint32_t)value,
-      value > 0);
+    // ---- Actuador REMOTO: ----
+    // V2-discovered remotes get reliable delivery; legacy-only keep the
+    // best-effort legacy path.
+    if (c.entity_id != 0) {
+      mesh::sendReliableV2Command(
+        c.device_uid, c.device_ip, c.entity_id,
+        (uint8_t)TYPE_DIMMER, (uint32_t)value, value > 0);
+    } else {
+      mesh::sendCommand(
+        c.device_uid, c.device_ip, c.uid,
+        (uint8_t)TYPE_DIMMER, (uint32_t)value, value > 0);
+    }
     return;
   }
 
@@ -872,32 +881,21 @@ void onV2StateUpdate(
   mesh::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
-void onV2Command(
+uint8_t onV2Command(
   uint32_t remote_uid,
+  const char * /*remote_ip*/,
+  uint32_t /*msg_id*/,
   const qymera::protocol::v2::CommandPayload &payload) {
-  // Find local actuator by entity_id
+  // Find local actuator by entity_id. The transport layer sends the
+  // COMMAND_ACK / COMMAND_ERROR using the returned status.
   int idx = findCalibByEntityId(payload.entity_id);
-  if (idx < 0) {
-    // Not found - send ERROR
-    mesh::sendV2CommandError(remote_uid, "unknown",
-                             payload.entity_id, payload.entity_id,
-                             1, "Entity not found");
-    return;
-  }
+  if (idx < 0) return qymera::delivery::ST_NOT_FOUND;
   auto &c = calibrations[idx];
-  if (!c.local) {
-    mesh::sendV2CommandError(remote_uid, "unknown",
-                             payload.entity_id, payload.entity_id,
-                             3, "Not local");
-    return;
-  }
-  // Check capability (only actuators are commandable)
+  if (!c.local) return qymera::delivery::ST_NOT_LOCAL;
+  // Only actuators (READ_WRITE) are commandable.
   if (qymera::model::capabilityOfType(payload.type) !=
       qymera::model::EntityCapability::READ_WRITE) {
-    mesh::sendV2CommandError(remote_uid, "unknown",
-                             payload.entity_id, payload.entity_id,
-                             2, "Invalid type");
-    return;
+    return qymera::delivery::ST_INVALID;
   }
 
   // Execute command
@@ -905,9 +903,10 @@ void onV2Command(
     setRelay(c.name, payload.state);
   } else if (payload.type == (uint8_t)sensors::TYPE_DIMMER) {
     handleDimmer(c.name, (int)payload.value);
+  } else {
+    return qymera::delivery::ST_INVALID;
   }
-  // Send ACK with OK status
-  mesh::sendV2CommandAck(remote_uid, "unknown", payload.entity_id, payload.entity_id, 0);
+  return qymera::delivery::ST_OK;
 }
 
 void onV2CommandAck(

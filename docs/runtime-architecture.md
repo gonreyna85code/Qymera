@@ -236,3 +236,61 @@ with `UPDATE_ERROR_FLASH_CONFIG` (8) — surfaced by `espota.py` as
   (`board_build.ldscript = eagle.flash.1m64.ld`) so PIO serial flashes write a
   1 MB header (verified: `firmware.bin` header nibble `0x2`). Use
   `eagle.flash.4m1m.ld` only when the node really has 4 MB.
+
+---
+
+## 12. Command Delivery Semantics (Phase 4)
+
+UDP and ESP-NOW do not guarantee sent == received == executed. Phase 4
+(`src/cmd_delivery.h`, namespace `qymera::delivery`) layers reliability on top
+of the V2 `COMMAND` / `COMMAND_ACK` / `COMMAND_ERROR` messages.
+
+### 12.1 Outbound (`ReliableQueue`)
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `MAX_PENDING` | 6 | Fixed queue depth (no dynamic allocation) |
+| `MAX_RETRIES` | 3 | Retransmissions after the first send |
+| `BASE_RETRY_MS` | 2000 / `RETRY_BACKOFF` 2 | Backoff 2 s → 4 s → 8 s |
+| `COMMAND_TTL_MS` | 30000 | Command dropped after 30 s unacknowledged |
+
+Flow (driven from `mesh::tick()`):
+
+1. `sensors` actuator path → `mesh::sendReliableV2Command()` → transmit `COMMAND` (ACK_REQ) + `ReliableQueue.enqueue()`.
+2. Inbound `COMMAND_ACK` / `COMMAND_ERROR` correlate on `msg_id` and free the slot (`onAck` / `onError`).
+3. Missed ACK → `deliveryTick()` retransmits **reusing the original `msg_id`**, backoff ×2 per attempt.
+4. Exhausted retries keep the slot until TTL, then decay with a warning.
+
+### 12.2 Inbound (`DupRing`)
+
+Retransmissions reuse `msg_id`, so the receiver dedups before executing:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `DUP_RING_SIZE` | 12 | Fixed ring |
+| `DUP_WINDOW_MS` | 20000 | Covers the 14 s retry schedule + margin |
+
+First sight → handler runs once, status recorded, one `COMMAND_ACK`/`COMMAND_ERROR`
+sent. Duplicate sight → response replayed from ring, actuator **not** re-executed.
+
+### 12.3 Ownership of the Response
+
+`V2CommandCallback` returns an `AckStatus` (0=OK, 1=not-found, 2=invalid,
+3=not-local, 4=busy). The transport sends the ACK/ERROR — handlers no longer
+emit their own, which removes the Phase 3 provisional double-ACK and the
+message-id mismatch (sensors used `entity_id` as `msg_id` before).
+
+### 12.4 Memory Impact
+
+Two fixed structs: `PendingCommand` ≈ 6 × ~20 B + `DupEntry` 12 × ~13 B ≈ ~280 B RAM, static.
+
+### 12.5 Files
+
+| File | Change |
+|------|--------|
+| `src/cmd_delivery.h` | NEW — `ReliableQueue`, `DupRing`, `AckStatus` (pure C++, host-testable) |
+| `src/protocol_v2.h`, `src/mesh.h` | `V2CommandCallback` returns `uint8_t`; `sendReliableV2Command()` decl |
+| `src/mesh.cpp` | queue/dup statics, `sendCommandFrame()` (shared msg_id), `sendReliableV2Command()`, `deliveryTick()` in `tick()`, ACK/ERROR correlation, inbound dedup + single response |
+| `src/sensors.h/cpp` | `onV2Command()` returns status (no internal ACK); remote actuators prefer reliable V2 when `entity_id != 0` |
+| `src/core.cpp` | periodic `sendV2Hello()` + per-entity `sendV2EntityAnnounce()` (gives remotes stable `entity_id`) |
+| `tests/host_sanity.py` | +36 command-delivery mirror tests (138/138 PASS) |

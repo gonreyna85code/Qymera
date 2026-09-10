@@ -167,8 +167,10 @@ void onV2StateUpdate(
   uint32_t remote_uid,
   const qymera::protocol::v2::StateUpdatePayload &payload);
 
-void onV2Command(
+uint8_t onV2Command(
   uint32_t remote_uid,
+  const char *remote_ip,
+  uint32_t msg_id,
   const qymera::protocol::v2::CommandPayload &payload);
 
 void onV2CommandAck(

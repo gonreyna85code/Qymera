@@ -293,6 +293,13 @@ void loop() {
     last_report = millis();
     Qymera::report();
     mesh::sendBinaryReport();
+    // V2 discovery (Phase 3/4): advertise capabilities and stable entity ids so
+    // peers can route actuator commands through the reliable V2 path. Coexists
+    // with the legacy broadcast for older fleet members.
+    mesh::sendV2Hello();
+    for (int i = 0; i < MAX_SENSORS; i++) {
+      mesh::sendV2EntityAnnounce(i);
+    }
   }
 
   if (ota_enabled && ota_initialized) {

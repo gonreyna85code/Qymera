@@ -4,6 +4,7 @@
 #include "sensors.h"
 #include "log.h"
 #include "model.h"
+#include "cmd_delivery.h"
 
 namespace mesh {
 
@@ -38,6 +39,14 @@ static qymera::protocol::v2::V2CommandErrorCallback v2_command_error_cb = nullpt
 
 // V2 message ID counter (monotonic per device)
 static uint32_t v2_msg_id_counter = 1;
+
+// Phase 4: reliable command delivery state (outbound retry queue, inbound
+// duplicate suppression). Owned by mesh; driven from mesh::tick().
+static qymera::delivery::ReliableQueue cmd_queue;
+static qymera::delivery::DupRing cmd_dup_ring;
+
+// Forward-declared (defined after the send helpers; used from tick()).
+static void deliveryTick(uint32_t now_ms);
 
 // ================= TRANSPORT =================
 static Transport transport = TRANSPORT_UDP;
@@ -98,6 +107,16 @@ void setV2CommandErrorCallback(qymera::protocol::v2::V2CommandErrorCallback cb) 
 
 // ================= BUFFER PARSER (shared) =================
 
+static const char *ackErrorText(uint8_t status) {
+  switch (status) {
+    case qymera::delivery::ST_NOT_FOUND: return "Entity not found";
+    case qymera::delivery::ST_INVALID:   return "Invalid type";
+    case qymera::delivery::ST_NOT_LOCAL: return "Not local";
+    case qymera::delivery::ST_BUSY:      return "Busy";
+    default:                             return "Command error";
+  }
+}
+
 static void parseV2Frame(const uint8_t *buf, uint16_t len, const char *remote_ip, uint32_t now_ms) {
   using namespace qymera::protocol::v2;
   Envelope env;
@@ -156,28 +175,54 @@ static void parseV2Frame(const uint8_t *buf, uint16_t len, const char *remote_ip
     case MsgType::COMMAND: {
       const CommandPayload *cp = asCommand(payload_ptr, payload_len);
       if (cp && v2_command_cb) {
-        v2_command_cb(env.src_uid, *cp);
-      }
-      // If ACK requested, send ACK
-      if (cp && (env.flags & (uint16_t)Flags::ACK_REQ)) {
-        // ACK with OK status - actual command execution happens in callback
-        // We don't know the result here; the callback will handle execution
-        // For now, send a provisional ACK. Full implementation needs callback to return status.
-        sendV2CommandAck(env.src_uid, remote_ip, env.msg_id, cp->entity_id, 0);
+        // Duplicate suppression: a retransmitted COMMAND (sender never got its
+        // ACK) must NOT execute the actuator twice. Re-send the stored result.
+        uint8_t status;
+        if (!cmd_dup_ring.isDuplicate(env.src_uid, env.msg_id, now_ms)) {
+          status = v2_command_cb(env.src_uid, remote_ip, env.msg_id, *cp);
+          cmd_dup_ring.record(env.src_uid, env.msg_id, status, now_ms);
+        } else {
+          status = cmd_dup_ring.statusFor(env.src_uid, env.msg_id, now_ms);
+        }
+        // The callback only executes; the transport owns the response. One
+        // ACK/ERROR per originating msg_id (no provisional double-ACK).
+        if (env.flags & (uint16_t)Flags::ACK_REQ) {
+          if (status == qymera::delivery::ST_OK) {
+            sendV2CommandAck(env.src_uid, remote_ip, env.msg_id, cp->entity_id,
+                             qymera::delivery::ST_OK);
+          } else {
+            sendV2CommandError(env.src_uid, remote_ip, env.msg_id,
+                               cp->entity_id, status, ackErrorText(status));
+          }
+        }
       }
       break;
     }
     case MsgType::COMMAND_ACK: {
       const CommandAckPayload *cap = asCommandAck(payload_ptr, payload_len);
-      if (cap && v2_command_ack_cb) {
-        v2_command_ack_cb(env.src_uid, *cap);
+      if (cap) {
+        // ACK correlation: match to the pending command and stop retrying.
+        if (cmd_queue.onAck(cap->msg_id) != 0xFF) {
+          logger::coref("V2 reliable: ACK msg=%08X entity=%08X status=%d",
+                        cap->msg_id, cap->entity_id, cap->status);
+        }
+        if (v2_command_ack_cb) {
+          v2_command_ack_cb(env.src_uid, *cap);
+        }
       }
       break;
     }
     case MsgType::COMMAND_ERROR: {
       const CommandErrorPayload *cep = asCommandError(payload_ptr, payload_len);
-      if (cep && v2_command_error_cb) {
-        v2_command_error_cb(env.src_uid, *cep);
+      if (cep) {
+        // An explicit error completes (cancels) the pending retry loop.
+        if (cmd_queue.onError(cep->msg_id) != 0xFF) {
+          logger::warnf("V2 reliable: ERROR msg=%08X code=%d (%s)",
+                        cep->msg_id, cep->error_code, cep->message);
+        }
+        if (v2_command_error_cb) {
+          v2_command_error_cb(env.src_uid, *cep);
+        }
       }
       break;
     }
@@ -397,6 +442,9 @@ void tick(uint32_t now_ms) {
       parseBuffer(buf, len, mac_str, now_ms);
     }
   }
+
+  // Phase 4: retransmit unacked commands with backoff, expire TTLs.
+  deliveryTick(now_ms);
 }
 
 // ================= DEVICES =================
@@ -688,25 +736,17 @@ void sendV2StateUpdate(uint8_t index) {
   }
 }
 
-void sendV2Command(uint32_t remote_uid, const char *remote_ip,
-                   uint32_t entity_id, uint8_t type, uint32_t value, bool state,
-                   bool ack_requested) {
-  if (!getRemoteDevice(remote_uid)) return;
-
+// Shared V2 COMMAND sender used by the one-shot path, the reliable path and
+// the retry scheduler. Envelope msg_id is passed explicitly so retries reuse
+// the original msg_id (ACK correlation depends on it).
+static void sendCommandFrame(uint32_t msg_id, uint32_t remote_uid,
+                             const char *remote_ip, uint16_t flags,
+                             const qymera::protocol::v2::CommandPayload &cp) {
   using namespace qymera::protocol::v2;
-  CommandPayload cp = {};
-  cp.entity_id = entity_id;
-  cp.type = type;
-  cp.flags = ack_requested ? (uint8_t)Flags::ACK_REQ : 0;
-  cp.value = value;
-  cp.state = state ? 1 : 0;
-
-  uint16_t flags = ack_requested ? (uint16_t)Flags::ACK_REQ : (uint16_t)Flags::NONE;
   uint8_t buf[sizeof(Envelope) + sizeof(CommandPayload)];
   uint16_t frame_len = buildFrame(buf, sizeof(buf),
                                   MsgType::COMMAND, GET_CHIP_ID(), remote_uid,
-                                  v2_msg_id_counter++, flags,
-                                  &cp, sizeof(cp));
+                                  msg_id, flags, &cp, sizeof(cp));
   if (frame_len == 0) return;
 
   if (transport == TRANSPORT_UDP) {
@@ -714,6 +754,86 @@ void sendV2Command(uint32_t remote_uid, const char *remote_ip,
   } else if (espnow_is_enabled()) {
     // ESP-NOW: broadcast (no unicast)
     espnow_send_broadcast(buf, frame_len);
+  }
+}
+
+void sendV2Command(uint32_t remote_uid, const char *remote_ip,
+                   uint32_t entity_id, uint8_t type, uint32_t value, bool state,
+                   bool ack_requested) {
+  if (!getRemoteDevice(remote_uid) || entity_id == 0) return;
+
+  if (ack_requested) {
+    // Reliable delivery delegates to the Phase 4 queue (retry + ACK).
+    sendReliableV2Command(remote_uid, remote_ip, entity_id, type, value, state);
+    return;
+  }
+
+  using namespace qymera::protocol::v2;
+  CommandPayload cp = {};
+  cp.entity_id = entity_id;
+  cp.type = type;
+  cp.value = value;
+  cp.state = state ? 1 : 0;
+  sendCommandFrame(v2_msg_id_counter++, remote_uid, remote_ip,
+                   (uint16_t)Flags::NONE, cp);
+}
+
+bool sendReliableV2Command(uint32_t remote_uid, const char *remote_ip,
+                           uint32_t entity_id, uint8_t type, uint32_t value,
+                           bool state) {
+  if (!getRemoteDevice(remote_uid) || entity_id == 0) return false;
+
+  using namespace qymera::protocol::v2;
+  CommandPayload cp = {};
+  cp.entity_id = entity_id;
+  cp.type = type;
+  cp.value = value;
+  cp.state = state ? 1 : 0;
+  cp.flags = (uint8_t)Flags::ACK_REQ;
+
+  uint32_t msg_id = v2_msg_id_counter++;
+  sendCommandFrame(msg_id, remote_uid, remote_ip, (uint16_t)Flags::ACK_REQ, cp);
+
+  uint8_t slot = cmd_queue.enqueue(msg_id, remote_uid, entity_id, type, value,
+                                   state, millis());
+  if (slot == 0xFF) {
+    logger::warnf("V2 reliable queue full - command msg=%08X dropped (no retry)",
+                  msg_id);
+    return false;
+  }
+  return true;
+}
+
+// Resends a queued command, reusing its original msg_id.
+static void resendPendingCommand(const qymera::delivery::PendingCommand &pc) {
+  using namespace qymera::protocol::v2;
+  CommandPayload cp = {};
+  cp.entity_id = pc.entity_id;
+  cp.type = pc.type;
+  cp.value = pc.value;
+  cp.state = pc.target_state ? 1 : 0;
+  cp.flags = (uint8_t)Flags::ACK_REQ;
+
+  RemoteDevice *dev = getRemoteDevice(pc.remote_uid);
+  if (!dev) return;
+  sendCommandFrame(pc.msg_id, pc.remote_uid, dev->ip,
+                   (uint16_t)Flags::ACK_REQ, cp);
+}
+
+// Phase 4: drives the reliable delivery state machine from the loop.
+static void deliveryTick(uint32_t now_ms) {
+  uint8_t expired = cmd_queue.expire(now_ms);
+  if (expired > 0) {
+    logger::warnf("V2 reliable: %u command(s) timed out (no ACK)", expired);
+  }
+
+  uint8_t i;
+  while ((i = cmd_queue.nextDue(now_ms)) != 0xFF) {
+    const qymera::delivery::PendingCommand &pc = cmd_queue.slots[i];
+    resendPendingCommand(pc);
+    cmd_queue.rescheduled(i, now_ms);
+    logger::coref("V2 reliable retry: msg=%08X entity=%08X attempt=%u",
+                  pc.msg_id, pc.entity_id, pc.attempts + 1);
   }
 }
 

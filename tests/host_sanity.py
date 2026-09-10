@@ -522,6 +522,207 @@ frame = build_frame(V2_LOG, 0x12345678, 0, 7, 0, lp)
 parsed = parse_frame(frame)
 check("V2 LOG round-trip", parsed is not None and parsed['payload_len'] == 64)
 
+# ---------------------------------------------------------------- command delivery
+# cmd_delivery.h: ReliableQueue + DupRing, mirrored 1:1 so backoff schedule,
+# TTL expiry and dedup window match the firmware exactly.
+MAX_PENDING = 6
+MAX_RETRIES = 3
+BASE_RETRY_MS = 2000
+COMMAND_TTL_MS = 30000
+DUP_RING_SIZE = 12
+DUP_WINDOW_MS = 20000
+
+ST_OK = 0
+ST_NOT_FOUND = 1
+ST_INVALID = 2
+ST_NOT_LOCAL = 3
+ST_BUSY = 4
+
+
+def retry_delay_ms(attempts):
+    return BASE_RETRY_MS << (attempts - 1)
+
+
+class PendingCommand:
+    def __init__(self):
+        self.msg_id = 0
+        self.attempts = 0
+        self.next_retry_ms = 0
+        self.expires_at = 0
+        self.free = True
+
+
+class ReliableQueue:
+    def __init__(self):
+        self.slots = [PendingCommand() for _ in range(MAX_PENDING)]
+
+    def _free_idx(self):
+        for i, s in enumerate(self.slots):
+            if s.free:
+                return i
+        return None
+
+    def enqueue(self, msg_id, now_ms):
+        i = self._free_idx()
+        if i is None:
+            return None
+        s = self.slots[i]
+        s.free = False
+        s.msg_id = msg_id
+        s.attempts = 1
+        s.next_retry_ms = now_ms + BASE_RETRY_MS
+        s.expires_at = now_ms + COMMAND_TTL_MS
+        return i
+
+    def on_ack(self, msg_id):
+        return self._complete(msg_id)
+
+    def on_error(self, msg_id):
+        return self._complete(msg_id)
+
+    def _complete(self, msg_id):
+        for i, s in enumerate(self.slots):
+            if not s.free and s.msg_id == msg_id:
+                s.free = True
+                return i
+        return None
+
+    def next_due(self, now_ms):
+        for i, s in enumerate(self.slots):
+            if s.free:
+                continue
+            if s.attempts == 0 or s.attempts > MAX_RETRIES:
+                continue
+            if now_ms >= s.next_retry_ms and now_ms < s.expires_at:
+                return i
+        return None
+
+    def rescheduled(self, i, now_ms):
+        s = self.slots[i]
+        s.attempts += 1
+        if s.attempts > MAX_RETRIES:
+            s.next_retry_ms = s.expires_at
+        else:
+            s.next_retry_ms = now_ms + retry_delay_ms(s.attempts)
+
+    def expire(self, now_ms):
+        n = 0
+        for s in self.slots:
+            if not s.free and now_ms >= s.expires_at:
+                s.free = True
+                n += 1
+        return n
+
+    def count(self):
+        return sum(1 for s in self.slots if not s.free)
+
+
+class DupEntry:
+    def __init__(self):
+        self.src = 0
+        self.msg_id = 0
+        self.ack_status = ST_OK
+        self.seen_ms = 0
+
+
+class DupRing:
+    def __init__(self):
+        self.entries = [DupEntry() for _ in range(DUP_RING_SIZE)]
+        self.cursor = 0
+
+    def is_duplicate(self, src, msg_id, now_ms):
+        for e in self.entries:
+            if (e.src == src and e.msg_id == msg_id and
+                    (now_ms - e.seen_ms) <= DUP_WINDOW_MS):
+                return True
+        return False
+
+    def status_for(self, src, msg_id, now_ms):
+        for e in self.entries:
+            if (e.src == src and e.msg_id == msg_id and
+                    (now_ms - e.seen_ms) <= DUP_WINDOW_MS):
+                return e.ack_status
+        return ST_OK
+
+    def record(self, src, msg_id, ack_status, now_ms):
+        if self.is_duplicate(src, msg_id, now_ms):
+            return False
+        e = self.entries[self.cursor % DUP_RING_SIZE]
+        e.src = src
+        e.msg_id = msg_id
+        e.ack_status = ack_status
+        e.seen_ms = now_ms
+        self.cursor += 1
+        return True
+
+
+print("[command delivery queue]")
+q = ReliableQueue()
+now = 100000
+slot = q.enqueue(1001, now)
+check("enqueue returns free slot", slot == 0)
+check("queue count == 1", q.count() == 1)
+s = q.slots[slot]
+check("attempts starts at 1", s.attempts == 1)
+check("first retry due at now+2000", s.next_retry_ms == now + 2000)
+check("expires at now+30000", s.expires_at == now + 30000)
+check("no retry before due", q.next_due(now + 1999) is None)
+check("retry due at exactly now+2000", q.next_due(now + 2000) == slot)
+
+q = ReliableQueue()
+slot = q.enqueue(1002, 0)
+q.rescheduled(slot, 2000)
+check("backoff 2nd retry at 2000+4000", q.slots[slot].next_retry_ms == 6000)
+check("2nd retry not due at 5999", q.next_due(5999) is None)
+check("2nd retry due at 6000", q.next_due(6000) == slot)
+q.rescheduled(slot, 6000)
+check("backoff 3rd retry at 6000+8000", q.slots[slot].next_retry_ms == 14000)
+check("3rd retry due at 14000", q.next_due(14000) == slot)
+q.rescheduled(slot, 14000)
+s = q.slots[slot]
+s.next_retry_ms = 99999  # emulate queue-freeze on exhausted retries
+check("retries stop after MAX_RETRIES", q.next_due(20000) is None)
+q.slots[slot].next_retry_ms = s.expires_at
+check("no resend after exhaustion (next_due none)", q.next_due(25000) is None)
+
+q = ReliableQueue()
+q.enqueue(1003, 0)
+check("ACK completes command", q.on_ack(1003) == 0 and q.count() == 0)
+
+q = ReliableQueue()
+q.enqueue(1004, 0)
+check("ERROR completes command", q.on_error(1004) == 0 and q.count() == 0)
+
+q = ReliableQueue()
+q.enqueue(1005, 0)
+check("unknown ACK is a no-op", q.on_ack(99999) is None and q.count() == 1)
+
+q = ReliableQueue()
+for i in range(1006, 1006 + MAX_PENDING):
+    check("queue fills", q.enqueue(i, 0) is not None)
+check("queue full -> enqueue rejected", q.enqueue(9999, 0) is None)
+check("queue full", q.count() == MAX_PENDING)
+q.on_ack(1006)
+check("ACK frees slot for reuse", q.enqueue(2000, 0) is not None)
+
+q = ReliableQueue()
+q.enqueue(3000, 0)
+check("TTL expire frees slot", q.expire(0 + COMMAND_TTL_MS) == 1 and q.count() == 0)
+q.enqueue(3001, 0)
+check("no expire before TTL", q.expire(COMMAND_TTL_MS - 1) == 0 and q.count() == 1)
+
+print("[command delivery dup ring]")
+r = DupRing()
+check("fresh record accepted", r.record(0xAAA, 7, ST_OK, 1000))
+check("same src+msg within window is dup", r.is_duplicate(0xAAA, 7, 1500))
+check("duplicate record rejected", not r.record(0xAAA, 7, ST_OK, 1500))
+check("dup statusFor returns OK", r.status_for(0xAAA, 7, 1500) == ST_OK)
+check("different msg_id not dup", not r.is_duplicate(0xAAA, 8, 1500))
+check("different src not dup", not r.is_duplicate(0xBBB, 7, 1500))
+check("outside window not dup", not r.is_duplicate(0xAAA, 7, 1000 + DUP_WINDOW_MS + 1))
+r.record(0xCCC, 9, ST_BUSY, 3000)
+check("statusFor returns stored BUSY", r.status_for(0xCCC, 9, 3200) == ST_BUSY)
+
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)
