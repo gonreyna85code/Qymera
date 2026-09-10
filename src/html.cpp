@@ -362,7 +362,7 @@ es: {
   good:'Bueno', warn:'Aviso', bad:'Malo'}, yn:{ yes:'Sí', no:'No', closed:'Cerrado', open:'Abierto'}, cal:{
   'btn.set0':'Fijar 0%', 'btn.set100':'Fijar 100%', 'btn.ref':'Fijar valor', 'btn.reset':'Resetear',
   'btn.fade':'Fijar fade', 'ph.ref':'Valor', 'ph.fade':'Fade (ms)', 'ph.pulse':'Tiempo de pulso (ms)',
-  'check.persist':'Persistencia', 'check.pulse':'Modo pulso (ms)'}, timezone:{
+  'valueReq':'Introduce un valor antes de fijar', 'check.persist':'Persistencia', 'check.pulse':'Modo pulso (ms)'}, timezone:{
   title:'Zona horaria'}, cfg:{
   title:'Configuración del nodo', broadcast:'Puerto broadcast', command:'Puerto comando',
   interval:'Intervalo de reporte', 'ph.broadcast':'Broadcast', 'ph.command':'Command',
@@ -425,7 +425,7 @@ en: {
   good:'Good', warn:'Warn', bad:'Bad'}, yn:{ yes:'Yes', no:'No', closed:'Closed', open:'Open'}, cal:{
   'btn.set0':'Set 0%', 'btn.set100':'Set 100%', 'btn.ref':'Set ref value', 'btn.reset':'Reset',
   'btn.fade':'Set fade', 'ph.ref':'Value', 'ph.fade':'Fade (ms)', 'ph.pulse':'Pulse time (ms)',
-  'check.persist':'Persistence', 'check.pulse':'Pulse mode (ms)'}, timezone:{
+  'valueReq':'Enter a value before setting', 'check.persist':'Persistence', 'check.pulse':'Pulse mode (ms)'}, timezone:{
   title:'Time zone'}, cfg:{
   title:'Node configuration', broadcast:'Broadcast port', command:'Command port',
   interval:'Report interval', 'ph.broadcast':'Broadcast', 'ph.command':'Command',
@@ -1193,12 +1193,20 @@ async function setCalib(i, type, name, refOverride = null) {
   if (!sensor)
     return false;
   const ref = refOverride !== null
-    ? refOverride
-    : (document.getElementById(`ref${i}`)?.value ?? '');
-  const body =
+    ? String(refOverride)
+    : (document.getElementById(`ref${i}`)?.value ?? '').trim();
+  // "Set ref value" requires an explicit value; the quick min/max buttons
+  // ("Set 0%"/"Set 100%") intentionally send none so the node uses the live
+  // raw reading as the reference.
+  if (type === 'ref' && ref === '') {
+    showToast('error', t('cal.valueReq'));
+    return false;
+  }
+  let body =
     `id=${encodeURIComponent(sensor.id)}` +
-    `&type=${encodeURIComponent(type)}` +
-    `&ref=${encodeURIComponent(ref)}`;
+    `&type=${encodeURIComponent(type)}`;
+  if (ref !== '')
+    body += `&ref=${encodeURIComponent(ref)}`;
   const r = await isVirtual(sensor.id, '/calib/set', body);
   if (r.handled)
     return r.ok;

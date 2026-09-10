@@ -975,8 +975,11 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
   }
 
   // ref/min/max: strict float; ref defaults to the live raw value.
+  // An empty ref argument (e.g. the "Set 0%/Set 100%" quick buttons read an
+  // empty input) must fall back to the live raw value, mirroring the
+  // empty-field handling used in handleSave().
   float ref;
-  if (server.hasArg("ref")) {
+  if (server.hasArg("ref") && server.arg("ref").length() > 0) {
     if (!parseStrictFloat(server.arg("ref"), ref)) {
       server.send(400, "text/plain", "invalid ref value");
       return;
