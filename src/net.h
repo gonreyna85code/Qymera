@@ -3,7 +3,7 @@
 #include "config.h"
 #include "protocol_v2.h"
 
-namespace mesh {
+namespace net {
 
 // ================= TRANSPORT MODE =================
 enum Transport : uint8_t {
@@ -233,7 +233,7 @@ void sendV2Command(uint32_t remote_uid, const char *remote_ip,
 
 // V2 Command Delivery Semantics (Phase 4): sends a COMMAND with ACK_REQ and
 // tracks it until COMMAND_ACK/COMMAND_ERROR or timeout, retrying with
-// exponential backoff from mesh::tick(). Returns false if not queued (queue
+// exponential backoff from net::tick(). Returns false if not queued (queue
 // full or unknown remote).
 bool sendReliableV2Command(uint32_t remote_uid, const char *remote_ip,
                            uint32_t entity_id, uint8_t type, uint32_t value,
@@ -265,7 +265,7 @@ bool isDeviceOnline(uint32_t uid);
 // Config
 // ============================================================================
 
-#define MESH_TIMEOUT 30000
+#define NET_TIMEOUT 30000
 
 // Discovery UDP batching: one datagram carries multiple local entities instead
 // of one datagram per sensor. The limit keeps a batch below the Ethernet MTU to
@@ -273,4 +273,4 @@ bool isDeviceOnline(uint32_t uid);
 // up to floor((1400-9)/58)=23 sensors fit per datagram.
 #define DISCOVERY_MAX_UDP_PACKET 1400
 
-}  // namespace mesh
+}  // namespace net

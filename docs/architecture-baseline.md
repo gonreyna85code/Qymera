@@ -3,7 +3,7 @@
 ## System Overview
 Qymeras is an ESP8266/ESP32 firmware for IoT sensor/actuation networks with:
 - Web-based configuration UI
-- ESP-NOW + WiFi mesh communication
+- ESP-NOW + WiFi peer communication (single broadcast domain)
 - Automation rules engine
 - EEPROM/Preferences persistence
 - OTA updates via Arduino framework
@@ -25,14 +25,14 @@ Qymeras is an ESP8266/ESP32 firmware for IoT sensor/actuation networks with:
        the TIME entity before `loadCalibration()` so its persisted
        correction/timezone restores. See *Persistence Fixes* below.
    - **Phase 2 (network startup):** `startWiFi()` (calls `esp_netif_init()` on ESP32 before WiFi ops, non-blocking STA connect or AP mode)
-   - **Deferred services** (initialized once WiFi is operational, in `checkWiFiStatus()` for STA or `startAP()` for AP mode): web server, mesh/transport layer, OTA module — guarded by `web_initialized`/`mesh_initialized`/`ota_initialized` flags; ArduinoOTA only starts when `ota_enabled` is true
+   - **Deferred services** (initialized once WiFi is operational, in `checkWiFiStatus()` for STA or `startAP()` for AP mode): web server, net layer, OTA module — guarded by `web_initialized`/`net_initialized`/`ota_initialized` flags; ArduinoOTA only starts when `ota_enabled` is true
 3. **`loop()`** (user sketch) → calls `Qymera::loop()`
 4. **`Qymera::loop()`** main state machine:
    - Process WiFi/ESP-NOW events
    - Tick automation rules
    - Handle web server requests (only when web initialized)
    - Manage OTA if enabled (runtime flag, `ArduinoOTA.handle()` every loop)
-   - First iteration: initial `report()` → `ensureTimeRegistered()` → `loadCalibration()` → `applyPersistedStates()` (persisted relay states applied before any mesh announce)
+   - First iteration: initial `report()` → `ensureTimeRegistered()` → `loadCalibration()` → `applyPersistedStates()` (persisted relay states applied before any net announce)
    - Report sensor states
 
 ### Runtime States
@@ -130,7 +130,7 @@ ESP32 maps each EEPROM address to a Preferences key (`String(addr)`) in namespac
 - **Fix 1 (config load after registration)**: `loadCalibration()` +
   `applyPersistedStates()` moved from `begin()` into the first-iteration block of
   `loop()`, immediately after the first `report()` (which registers all local
-  entities) and before any mesh announce.
+  entities) and before any net announce.
 - **Fix 2 (TIME pre-registration)**: `sensors::ensureTimeRegistered()` binds the
   TIME entity before `loadCalibration()`, so its persisted correction/timezone is
   restored even though NTP sync happens later.
@@ -176,7 +176,7 @@ nodes; every response (including 400/401/429) carries
   Stale remotes, `SENSOR_NONE`, and invalid types are filtered by
   `isDeviceVisible()` before rendering; one card per active entry. Remote
   recency uses the server-computed `age_ms` field (same `millis()` timebase as
-  `MESH_TIMEOUT`); `id` carries the sensor uid (the JSON does not duplicate it
+  `NET_TIMEOUT`); `id` carries the sensor uid (the JSON does not duplicate it
   as `uid`).
 - **Settings tab**: renders cards for ANY valid/configurable entity — local or
   remote — since `local` indicates provenance, not configurability. Remote
@@ -228,18 +228,18 @@ nodes; every response (including 400/401/429) carries
   reports, commands AND logs, so `LogPacket` payloads were interpreted as
   `Packet` payloads and generated phantom remote sensors with garbage
   type/name bytes (e.g. types 108/109/115/119) and phantom UI cards.
-- Logs received over the mesh are ingested into the local log buffer via
+- Logs received over the net are ingested into the local log buffer via
   `logger::logRemote()` (no re-broadcast, preventing a broadcast ping-pong).
 - Compatibility: v1/v2 sensor packets and v3 sensor packets are still accepted
   (no kind byte → sensor payload). Legacy v3 log packets fail the exact-size
   validation and are dropped instead of being fragmented into fake sensors.
-- Wire-format sizes are enforced by `static_assert` in `mesh.cpp`.
+- Wire-format sizes are enforced by `static_assert` in `net.cpp`.
 
 ## Remote Sensor Lifecycle
 
-- Remote sensors discovered over the mesh live in `sensors::calibrations[]`
+- Remote sensors discovered over the net live in `sensors::calibrations[]`
   with `local = false`, `device_uid`, `uid` and `last_update`.
-- A remote entry is **active** while `millis() - last_update <= MESH_TIMEOUT`
+- A remote entry is **active** while `millis() - last_update <= NET_TIMEOUT`
   (30000 ms); afterwards it is **stale**.
 - Stale remotes are excluded from `/calib` (and therefore from Devices/Settings
   UIs) even while their slot still exists internally.
@@ -253,7 +253,7 @@ nodes; every response (including 400/401/429) carries
 
 ### Discovery Redistribution Loop (fixed)
 
-- Discovery announces ONLY local entities: `mesh::sendBinaryReport()` skips
+- Discovery announces ONLY local entities: `net::sendBinaryReport()` skips
   `!c.local`. The loop source was on the RECEIVING side: the sensor read
   functions (`temperature`, `humidity`, `luminosity`, `level`, `pressure`,
   `airQ`, `rain`, `custom`, `contact`, `aidig`, `aiana`) looked up slots by name
@@ -276,7 +276,7 @@ nodes; every response (including 400/401/429) carries
   transmitted **one UDP datagram per local sensor** while the receiver processed
   **one datagram per socket per tick**. Under bursts the queue overflowed on
   ESP32; ESP8266 only survived thanks to stack buffering/timing differences.
-- Fix (`mesh.cpp`):
+- Fix (`net.cpp`):
   - `sendBinaryReport()` now batches up to
     `floor((DISCOVERY_MAX_UDP_PACKET-9)/47) = 29` `Packet`s per UDP datagram
     (`DISCOVERY_MAX_UDP_PACKET = 1400`, below the Ethernet MTU → no IP
@@ -289,7 +289,7 @@ nodes; every response (including 400/401/429) carries
     overflow counter; dropped messages are logged from `loop()` (see
     *ESP-NOW Transport*).
   - `parseUDPPacket()` drains up to `MAX_RX_PACKETS_PER_TICK` (8) datagrams per
-    socket per tick (both `mesh_udp` and `udp`), bounded so a UDP storm cannot
+    socket per tick (both historical `mesh_udp` and `udp`), bounded so a UDP storm cannot
     starve `loop()`; the RX buffer was raised from 512 to 1400 bytes.
   - All validations are preserved (magic, version, kind, `hdr.size == len`,
     packet alignment, valid types). Discovery remains idempotent
@@ -314,7 +314,7 @@ nodes; every response (including 400/401/429) carries
 - **AP mode**: ESP-NOW broadcast
 - Auto-switched based on WiFi mode at boot
 
-## Mesh (ESP-NOW P2P)
+## ESP-NOW P2P (formerly "mesh")
 
 ### Peer Management
 - **Max peers**: 25
@@ -333,7 +333,7 @@ nodes; every response (including 400/401/429) carries
 - **Bounded RX FIFO** (8 entries x 250 bytes): the interrupt/IRAM callback
   copies payload+len+src MAC into the ring via `rx_enqueue()` under an ESP32
   portMUX critical section and never blocks, allocates, or logs. When full the
-  new message is dropped and a `rx_overflow` counter is bumped; `mesh::tick()`
+  new message is dropped and a `rx_overflow` counter is bumped; `net::tick()`
   logs a warning with the delta. `espnow_recv()` consumes the FIFO from
   `loop()`. This removes the old single-slot buffer that could drop traffic
   under bursts.

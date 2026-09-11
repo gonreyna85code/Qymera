@@ -50,7 +50,7 @@ static const char* EXPECTED_AUTH_BASE64 = "YWRtaW46cXltZXJhMTIz";  // "admin:qym
 
 **Protected Endpoints**:
 - `/save` (WiFi credentials)
-- `/genset/save` (mesh ports, interval)
+- `/genset/save` (net/broadcast ports, interval)
 - `/factory` (factory reset)
 - `/toggle`, `/dimmer` (actuator control)
 - `/rules/set`, `/rules/delete` (automation rules)
@@ -99,7 +99,7 @@ Access-Control-Allow-Headers: Content-Type
 - OPTIONS preflight handled
 - No credentials mode (no cookies)
 
-### 2.5 Mesh/Network Layer
+### 2.5 Networking Layer
 
 **No authentication at protocol level**:
 
@@ -142,7 +142,7 @@ uint32_t calculateFirmwareHash() {
 |-----|----------|-------------|
 | **Auth disabled by default** | High | Any LAN device can control actuators, change WiFi, factory reset |
 | **No command ACK/replay protection** | Medium | Commands can be replayed; no delivery guarantee |
-| **No mesh encryption/signing** | Medium | LAN sniffing reveals all state; command injection possible |
+| **No net encryption/signing** | Medium | LAN sniffing reveals all state; command injection possible |
 | **No firmware signature verification** | High | OTA accepts any binary; chip-ID check only detects chip swap |
 | **Plaintext credentials (ESP8266)** | Medium | EEPROM readable via serial/physical |
 | **Permissive CORS** | Low | Any web page can call API (mitigated by auth) |
@@ -161,7 +161,7 @@ uint32_t calculateFirmwareHash() {
 2. **Change default credentials** — force setup-time password
 3. **Firmware signing** — Ed25519 sig verification on OTA
 4. **Command ACK + msg_id** — replay protection at protocol level
-4. **Mesh encryption** — AES-GCM or ChaCha20-Poly1305 (PSK per deployment)
+4. **Net encryption** — AES-GCM or ChaCha20-Poly1305 (PSK per deployment)
 
 ### 4.2 Recommended
 
@@ -206,4 +206,4 @@ For production deployment:
 | OTA tampering | Flash modified firmware → OTA rejected (after signing) |
 | Credential extraction | Read EEPROM/Preferences → credentials not plaintext (ESP32 OK, ESP8266 gap) |
 | CSRF | Authenticated browser form submit without token → rejected (after CSRF tokens) |
-| Mesh injection | Send crafted UDP packet → validated, not crashed |
+| Net injection | Send crafted net packet → validated, not crashed |

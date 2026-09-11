@@ -20,7 +20,7 @@ Este roadmap aplica únicamente a:
 * automatizaciones
 * persistencia
 * networking
-* protocolo mesh
+* protocolo net
 * API HTTP
 * seguridad
 * logging
@@ -579,7 +579,7 @@ Auditar:
 * HTTP responses
 * logging
 * remote entity creation
-* mesh packets
+* net packets
 
 Identificar:
 
@@ -611,7 +611,7 @@ Con:
 boot heap
 idle heap
 UI request heap
-mesh peak
+net peak
 automation peak
 OTA peak
 ```
@@ -629,8 +629,8 @@ Modelo conceptual:
 ```text
 Web task
 WiFi task
-Mesh RX task
-Mesh TX task
+Net RX task
+Net TX task
 Sensor task
 Automation task
 Persistence task
@@ -1010,7 +1010,7 @@ La release final debe requerir:
 
 * 24h minimum soak
 * repeated UI polling
-* mesh traffic
+* net traffic
 
 ### Security
 

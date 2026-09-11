@@ -4,7 +4,7 @@
 #include "config.h"
 #include "model.h"
 #include "core.h"
-#include "mesh.h"
+#include "net.h"
 #include "web.h"
 #include "automations.h"
 #include "log.h"
@@ -85,15 +85,15 @@ void init() {
     calibrations[i] = Calibration();
     activeFades[i] = Fade();
   }
-  mesh::setSensorDiscoveryCallback(onRemoteSensorDiscovered);
-  mesh::setCommandCallback(onRemoteCommand);
+  net::setSensorDiscoveryCallback(onRemoteSensorDiscovered);
+  net::setCommandCallback(onRemoteCommand);
 
   // V2 Protocol callbacks
-  mesh::setV2EntityAnnounceCallback(onV2EntityAnnounce);
-  mesh::setV2StateUpdateCallback(onV2StateUpdate);
-  mesh::setV2CommandCallback(onV2Command);
-  mesh::setV2CommandAckCallback(onV2CommandAck);
-  mesh::setV2CommandErrorCallback(onV2CommandError);
+  net::setV2EntityAnnounceCallback(onV2EntityAnnounce);
+  net::setV2StateUpdateCallback(onV2StateUpdate);
+  net::setV2CommandCallback(onV2Command);
+  net::setV2CommandAckCallback(onV2CommandAck);
+  net::setV2CommandErrorCallback(onV2CommandError);
 }
 
 void applyPersistedStates() {
@@ -107,7 +107,7 @@ void applyPersistedStates() {
     pinMode(c.pin, OUTPUT);
     digitalWrite(c.pin, c.inverted ? !on : on);
     c.state = on;
-    mesh::setReport(i, c.uid, c.value, c.value, c.state);
+    net::setReport(i, c.uid, c.value, c.value, c.state);
   }
 }
 
@@ -124,7 +124,7 @@ bool isStaleRemote(int index) {
   auto &c = calibrations[index];
   if (c.local || c.uid == 0) return false;
   // Wrap-safe elapsed check (millis() overflow after ~49 days).
-  return (uint32_t)(millis() - c.last_update) > MESH_TIMEOUT;
+  return (uint32_t)(millis() - c.last_update) > NET_TIMEOUT;
 }
 
 bool isEntryVisible(int index) {
@@ -139,7 +139,7 @@ bool isEntryVisible(int index) {
 void reclaimStaleSlots() {
   static unsigned long last_pass = 0;
   // Run at most once per timeout window.
-  if ((uint32_t)(millis() - last_pass) < MESH_TIMEOUT) return;
+  if ((uint32_t)(millis() - last_pass) < NET_TIMEOUT) return;
   last_pass = millis();
   for (int i = 0; i < MAX_SENSORS; i++) {
     auto &c = calibrations[i];
@@ -196,7 +196,7 @@ void checkPulses() {
         web::saveCalibrationSlot(i);
       }
       logger::sensorsf("Relay %s -> OFF", c.name.c_str());
-      mesh::setReport(i, c.uid, c.value, c.value, c.state);
+      net::setReport(i, c.uid, c.value, c.value, c.state);
     }
   }
 }
@@ -239,11 +239,11 @@ void setRelay(const String &key, bool target) {
     // V2-discovered remotes (stable entity_id) get reliable delivery (ACK +
     // retry + timeout). Legacy-only remotes keep the best-effort legacy path.
     if (c.entity_id != 0) {
-      mesh::sendReliableV2Command(
+      net::sendReliableV2Command(
         c.device_uid, c.device_ip, c.entity_id,
         (uint8_t)TYPE_RELAY, target ? 1u : 0u, target);
     } else {
-      mesh::sendCommand(
+      net::sendCommand(
         c.device_uid, c.device_ip, c.uid,
         (uint8_t)TYPE_RELAY, target ? 1u : 0u, target);
     }
@@ -284,7 +284,7 @@ void setRelay(const String &key, bool target) {
   }
 
   logger::sensorsf("Relay %s -> %s", c.name.c_str(), target ? "ON" : "OFF");
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void handleDimmer(const String &key, int value) {
@@ -299,11 +299,11 @@ void handleDimmer(const String &key, int value) {
     // V2-discovered remotes get reliable delivery; legacy-only keep the
     // best-effort legacy path.
     if (c.entity_id != 0) {
-      mesh::sendReliableV2Command(
+      net::sendReliableV2Command(
         c.device_uid, c.device_ip, c.entity_id,
         (uint8_t)TYPE_DIMMER, (uint32_t)value, value > 0);
     } else {
-      mesh::sendCommand(
+      net::sendCommand(
         c.device_uid, c.device_ip, c.uid,
         (uint8_t)TYPE_DIMMER, (uint32_t)value, value > 0);
     }
@@ -323,7 +323,7 @@ void handleDimmer(const String &key, int value) {
   c.value = value;
   c.state = (value > 0);
   logger::sensorsf("Dimmer %s -> %d%%", c.name.c_str(), value);
-  mesh::setReport(idx, c.uid, c.value, c.state ? c.value : 0, c.state);
+  net::setReport(idx, c.uid, c.value, c.state ? c.value : 0, c.state);
 }
 
 void handleToggle(uint32_t uid) {
@@ -356,7 +356,7 @@ void handleToggle(uint32_t uid) {
         (uint8_t)(c.state ? pwm_val : 0));
     }
     logger::sensorsf("Dimmer %s -> %s", c.name.c_str(), c.state ? "ON" : "OFF");
-    mesh::setReport(
+    net::setReport(
       idx,
       c.uid,
       c.value,
@@ -395,7 +395,7 @@ void temperature(const String &key, float raw) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_TEMP);
   c.value = calibrate(key, raw);
-  mesh::setReport(idx, c.uid, c.value, raw, c.state);
+  net::setReport(idx, c.uid, c.value, raw, c.state);
 }
 
 void humidity(const String &key, int raw) {
@@ -405,7 +405,7 @@ void humidity(const String &key, int raw) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_HUMI);
   c.value = calibrate(key, raw);
-  mesh::setReport(idx, c.uid, c.value, raw, c.state);
+  net::setReport(idx, c.uid, c.value, raw, c.state);
 }
 
 void luminosity(const String &key, int raw) {
@@ -415,7 +415,7 @@ void luminosity(const String &key, int raw) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_LUMI);
   c.value = calibrate(key, raw);
-  mesh::setReport(idx, c.uid, c.value, raw, c.state);
+  net::setReport(idx, c.uid, c.value, raw, c.state);
 }
 
 void level(const String &key, int raw) {
@@ -425,7 +425,7 @@ void level(const String &key, int raw) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_LEVEL);
   c.value = calibrate(key, raw);
-  mesh::setReport(idx, c.uid, c.value, raw, c.state);
+  net::setReport(idx, c.uid, c.value, raw, c.state);
 }
 
 void pressure(const String &key, float raw) {
@@ -435,7 +435,7 @@ void pressure(const String &key, float raw) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_PRESS);
   c.value = calibrate(key, raw);
-  mesh::setReport(idx, c.uid, c.value, raw, c.state);
+  net::setReport(idx, c.uid, c.value, raw, c.state);
 }
 
 void airQ(const String &key, const int &v) {
@@ -445,7 +445,7 @@ void airQ(const String &key, const int &v) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_AIRQ);
   c.value = v;
-  mesh::setReport(idx, c.uid, c.value, v, c.state);
+  net::setReport(idx, c.uid, c.value, v, c.state);
 }
 
 void rain(const String &key, bool v) {
@@ -456,7 +456,7 @@ void rain(const String &key, bool v) {
   bindLocalSensor(idx, key, SENSOR_RAIN);
   c.state = v;
   c.value = v ? 1.0f : 0.0f;
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void custom(const String &key, float raw) {
@@ -466,7 +466,7 @@ void custom(const String &key, float raw) {
   auto &c = calibrations[idx];
   bindLocalSensor(idx, key, SENSOR_GENERIC);
   c.value = calibrate(key, raw);
-  mesh::setReport(idx, c.uid, c.value, raw, c.state);
+  net::setReport(idx, c.uid, c.value, raw, c.state);
 }
 
 void contact(const String &key, bool v) {
@@ -477,7 +477,7 @@ void contact(const String &key, bool v) {
   bindLocalSensor(idx, key, SENSOR_CONTACT);
   c.state = v;
   c.value = v ? 0.0f : 1.0f;
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void relay(const String &key, uint8_t pin, bool inverted) {
@@ -503,7 +503,7 @@ void relay(const String &key, uint8_t pin, bool inverted) {
     // OFF -> ON glitch on persistent relays at boot.
     pinMode(pin, OUTPUT);
   }
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void dimmer(const String &key, uint8_t pin, bool inverted) {
@@ -524,7 +524,7 @@ void dimmer(const String &key, uint8_t pin, bool inverted) {
       off_pwm = PWM_MAX_OUT;
     pwmWritePin(pin, (uint8_t)off_pwm);
   }
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void ensureTimeRegistered() {
@@ -548,7 +548,7 @@ static void updateTimeSensor() {
   }
   auto &c = calibrations[idx];
   c.value = (float)now;
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 float calibrate(const String &key, float raw) {
@@ -666,7 +666,7 @@ void updateNTPTime() {
 // ========================================
 
 /**
- * @brief Invocada por mesh::tick() cuando llega un paquete dirigido a este
+ * @brief Invocada por net::tick() cuando llega un paquete dirigido a este
  *        dispositivo (is_remote == false).  Busca el actuador por su uid y
  *        delega en setRelay / handleDimmer para ejecutar la acción LOCAL.
  *
@@ -699,7 +699,7 @@ void onRemoteCommand(
 }
 
 // ========================================
-// MESH CALLBACKS - Procesadas por sensors.cpp
+// NET CALLBACKS - Procesadas por sensors.cpp
 // ========================================
 
 void onRemoteSensorDiscovered(
@@ -792,7 +792,7 @@ void onRemoteSensorDiscovered(
   if (is_new) {
     logger::sensorsf("New remote sensor '%s' (type:%d, uid:%u)", c.name.c_str(), sensor_type, sensor_id);
   }
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 // ========================================
@@ -860,7 +860,7 @@ void onV2EntityAnnounce(
     logger::sensorsf("V2 New remote entity '%s' (type:%d, entity_id:%08X)",
                      c.name.c_str(), payload.type, payload.entity_id);
   }
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void onV2StateUpdate(
@@ -878,7 +878,7 @@ void onV2StateUpdate(
               : ((float)payload.value / 0xFFFFFFFF) * (150.0f - (-50.0f)) + (-50.0f);
   c.avail = payload.avail;
   c.last_update = millis();
-  mesh::setReport(idx, c.uid, c.value, c.value, c.state);
+  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 uint8_t onV2Command(

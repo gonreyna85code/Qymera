@@ -1,4 +1,5 @@
 #include "espnow_p2p.h"
+
 #include "log.h"
 
 #if defined(ESP8266)
@@ -7,7 +8,8 @@
 #include <esp_now.h>
 #endif
 
-namespace mesh {
+namespace qymera {
+namespace espnow {
 
 // Bounded RX FIFO (single producer = ESP-NOW callback, single consumer =
 // loop()). No dynamic memory. Each entry stores payload + length + src MAC.
@@ -84,7 +86,7 @@ static void espnow_recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
 
 // ================= API =================
 
-bool espnow_init() {
+bool init() {
   if (esp_now_init() == 0) {
 #if defined(ESP8266)
     esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
@@ -99,7 +101,7 @@ bool espnow_init() {
   return false;
 }
 
-void espnow_send_broadcast(const uint8_t *data, uint16_t len) {
+void send_broadcast(const uint8_t *data, uint16_t len) {
   if (!espnow_ready || !espnow_enabled) return;
   for (int i = 0; i < peer_count; i++) {
     esp_now_send(peers[i], (uint8_t *)data, len);
@@ -108,7 +110,7 @@ void espnow_send_broadcast(const uint8_t *data, uint16_t len) {
   esp_now_send(broadcast, (uint8_t *)data, len);
 }
 
-bool espnow_recv(uint8_t *buf, uint16_t *len, uint8_t *src_mac) {
+bool recv(uint8_t *buf, uint16_t *len, uint8_t *src_mac) {
 #if defined(ESP32)
   portENTER_CRITICAL(&rx_mux);
 #endif
@@ -130,15 +132,15 @@ bool espnow_recv(uint8_t *buf, uint16_t *len, uint8_t *src_mac) {
   return true;
 }
 
-uint32_t espnow_get_rx_overflow() {
+uint32_t get_rx_overflow() {
   return rx_overflow;
 }
 
-uint8_t espnow_get_rx_queue_depth() {
+uint8_t get_rx_queue_depth() {
   return rx_count;
 }
 
-void espnow_add_peer(const uint8_t *mac) {
+void add_peer(const uint8_t *mac) {
   if (!espnow_ready) return;
   if (peer_count >= 25) return;
   for (int i = 0; i < peer_count; i++) {
@@ -158,7 +160,7 @@ void espnow_add_peer(const uint8_t *mac) {
   logger::coref("ESP-NOW peer added (%d total)", peer_count);
 }
 
-void espnow_clear_peers() {
+void clear_peers() {
   if (!espnow_ready) return;
   for (int i = 0; i < peer_count; i++) {
     esp_now_del_peer(peers[i]);
@@ -166,16 +168,17 @@ void espnow_clear_peers() {
   peer_count = 0;
 }
 
-uint8_t espnow_get_peer_count() {
+uint8_t get_peer_count() {
   return peer_count;
 }
 
-void espnow_set_enabled(bool enabled) {
+void set_enabled(bool enabled) {
   espnow_enabled = enabled;
 }
 
-bool espnow_is_enabled() {
+bool is_enabled() {
   return espnow_enabled;
 }
 
-}  // namespace mesh
+}  // namespace espnow
+}  // namespace qymera

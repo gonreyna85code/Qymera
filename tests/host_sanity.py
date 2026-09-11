@@ -6,7 +6,7 @@ can be validated on the host machine (no native C++ toolchain required):
 1. timezone conversion  - mirrors sensors.cpp: timezoneOffsetMinutes()/
                           toLocalEpoch()/getTime()/getMinutesOfDay()
 2. strict float parsing - mirrors web.cpp: parseStrictFloat()
-3. ESP-NOW RX FIFO      - mirrors espnow_p2p.cpp: rx_enqueue()/espnow_recv()
+3. ESP-NOW RX FIFO      - mirrors espnow_p2p.cpp: rx_enqueue()/recv()
 
 Run:  python tests/host_sanity.py
 Exit code 0 = all pass.

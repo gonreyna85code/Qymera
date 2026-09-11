@@ -1,4 +1,4 @@
-#include "mesh.h"
+#include "net.h"
 #include "config.h"
 #include "core.h"
 #include "sensors.h"
@@ -7,7 +7,7 @@
 #include "cmd_delivery.h"
 #include "transport.h"
 
-namespace mesh {
+namespace net {
 
 // Wire-format guards: any change to the packed structs that alters their size
 // must be reviewed against parseBuffer/senders (protocol compatibility).
@@ -39,7 +39,7 @@ static qymera::protocol::v2::V2CommandErrorCallback v2_command_error_cb = nullpt
 static uint32_t v2_msg_id_counter = 1;
 
 // Phase 4: reliable command delivery state (outbound retry queue, inbound
-// duplicate suppression). Owned by mesh; driven from mesh::tick().
+// duplicate suppression). Owned by net; driven from net::tick().
 static qymera::delivery::ReliableQueue cmd_queue;
 static qymera::delivery::DupRing cmd_dup_ring;
 
@@ -47,14 +47,14 @@ static qymera::delivery::DupRing cmd_dup_ring;
 static void deliveryTick(uint32_t now_ms);
 
 // ================= TRANSPORT =================
-// The selected medium lives in qymera::transport. mesh only mirrors it for the
-// legacy mesh::setTransport/getTransport API (core.cpp selects WiFi vs AP mode).
+// The selected medium lives in qymera::transport. net only mirrors it for the
+// legacy net::setTransport/getTransport API (core.cpp selects WiFi vs AP mode).
 
 void setTransport(Transport t) {
   qymera::transport::setActive(
     t == TRANSPORT_ESPNOW ? qymera::transport::Kind::ESP_NOW
                           : qymera::transport::Kind::UDP);
-  logger::coref("Mesh transport: %s",
+  logger::coref("Net transport: %s",
                 t == TRANSPORT_ESPNOW ? "ESP-NOW" : "UDP");
 }
 
@@ -259,7 +259,7 @@ static void parseBuffer(const uint8_t *buf, uint16_t len, const char *remote_ip,
     kind = (PacketKind)buf[header_size];
     header_size += 1;
     if (kind != PACKET_SENSOR && kind != PACKET_LOG) {
-      logger::warnf("Mesh: unknown packet kind %u rejected", (uint8_t)kind);
+      logger::warnf("Net: unknown packet kind %u rejected", (uint8_t)kind);
       return;
     }
   }
@@ -372,7 +372,7 @@ static void parseBuffer(const uint8_t *buf, uint16_t len, const char *remote_ip,
   if (now_ms - last_cleanup > 30000) {
     last_cleanup = now_ms;
     for (int i = 0; i < remote_device_count; i++) {
-      if (now_ms - remote_devices[i].last_seen > MESH_TIMEOUT) {
+      if (now_ms - remote_devices[i].last_seen > NET_TIMEOUT) {
         remote_devices[i].online = false;
       }
     }
@@ -774,4 +774,4 @@ void sendV2CommandError(uint32_t remote_uid, const char *remote_ip,
   qymera::transport::unicast(remote_ip, buf, frame_len);
 }
 
-}  // namespace mesh
+}  // namespace net

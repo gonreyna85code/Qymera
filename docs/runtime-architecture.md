@@ -11,7 +11,7 @@
 Qymera is a deterministic, local-first distributed automation runtime for ESP-class devices (ESP8266, ESP32, ESP32-C3/S2/S3). It provides:
 
 - Embedded web HTTP server with GUI
-- P2P UDP/ESP-NOW mesh communication
+- P2P UDP/ESP-NOW peer communication (single broadcast domain; see `docs/networking.md`)
 - Rule engine (EDGE, THRESHOLD, TIME, INTERVAL)
 - EEPROM/Preferences persistence
 - Sensors and actuators with relay/dimmer control
@@ -26,13 +26,13 @@ src/
 ├── Qymera.h          # Public facade (namespace Qymera::)
 ├── config.h          # Platform abstraction, constants, EEPROM layout
 ├── core.h/cpp        # Runtime orchestration, WiFi, OTA, main loop
-├── sensors.h/cpp     # Entity model, sensors/actuators, mesh callbacks
+├── sensors.h/cpp     # Entity model, sensors/actuators, net callbacks
 ├── web.h/cpp         # HTTP server, API endpoints, auth, rate limit
-├── mesh.h/cpp        # UDP/ESP-NOW transport, packet parsing, discovery
+├── net.h/cpp         # Peer discovery/messaging, packet parsing (Phase 6: renamed from mesh)
 ├── automations.h/cpp # Rule engine (EDGE/THRESHOLD/TIME/INTERVAL)
 ├── storage.h/cpp     # EEPROM/Preferences persistence, migration
 ├── log.h/cpp         # Layered logging, UDP broadcast, remote log ingest
-├── espnow_p2p.cpp    # ESP-NOW RX FIFO (bounded ring buffer)
+├── espnow_p2p.cpp    # ESP-NOW P2P backend (namespace qymera::espnow)
 ├── html.cpp          # Embedded GUI (single-page app, ~70KB compressed)
 └── main.ino          # PlatformIO sketch entry (ignored by Arduino IDE lib build)
 ```
@@ -51,12 +51,12 @@ core::begin()
   ├── storage::loadGeneralSettings()
   ├── setupWiFiEvents()
   ├── storage::loadOtaFlag() + verifyOtaIntegrity()
-  ├── sensors::init()                    # 1. Clear calibrations, register mesh callbacks
+  ├── sensors::init()                    # 1. Clear calibrations, register net callbacks
   ├── Qymera::init()                     # 2. User hook: register sensors/actuators
   ├── automations::init()                # 3. Load rules, clear rule states
   ├── startWiFi()                        # Phase 2: Network startup (deferred)
        ├── WiFi.begin() or startAP()
-       ├── On connect: sensors::initNTP(), mesh::init(), web::init(), OTA
+       ├── On connect: sensors::initNTP(), net::init(), web::init(), OTA
        └── On timeout: startAP()
 ```
 
@@ -67,21 +67,21 @@ core::loop()  [runs continuously]
   ├── web::server.handleClient()         # HTTP handling
   ├── checkWiFiStatus()                  # Reconnect logic, deferred service init
   ├── WiFi retry logic (180s interval)
-  ├── mesh::setTransport()               # UDP if WiFi, ESP-NOW if AP/offline
+  ├── net::setTransport()               # UDP if WiFi, ESP-NOW if AP/offline
   ├── First iteration (first_report):
-  │   ├── Qymera::report()               # Register entities, send initial mesh announce
+  │   ├── Qymera::report()               # Register entities, send initial net announce
   │   ├── sensors::ensureTimeRegistered()
   │   ├── storage::loadCalibration()     # Restore persisted state by UID
   │   └── sensors::applyPersistedStates()# Apply relay states (persist → pers_state)
   ├── sensors::updateNTPTime()
-  ├── mesh::tick(now_ms)                 # UDP/ESP-NOW RX, parsing, discovery
+  ├── net::tick(now_ms)                 # RX drain (transport::poll), parsing, discovery
   ├── sensors::reclaimStaleSlots()       # Remote entity lifecycle
   ├── automations::tick(now_ms)          # Rule evaluation
   ├── sensors::applyFades()
   ├── sensors::checkPulses()
   ├── Periodic report (genset.report_interval):
   │   ├── Qymera::report()
-  │   └── mesh::sendBinaryReport()
+  │   └── net::sendBinaryReport()
   └── ArduinoOTA.handle() (if enabled)
 ```
 
@@ -91,7 +91,7 @@ core::loop()  [runs continuously]
 
 **Single-threaded cooperative scheduler** (Arduino `loop()`). All subsystems cooperate via:
 
-- `mesh::tick()`: bounded UDP drain (max 8 packets/tick per socket)
+- `net::tick()`: bounded UDP drain (transport::RECV_BUDGET per socket per cycle)
 - `automations::tick()`: 50ms minimum sample interval
 - `sensors::checkPulses()/applyFades()`: stateless per-tick
 - `web::handleClient()`: non-blocking HTTP
@@ -105,7 +105,7 @@ core::loop()  [runs continuously]
 | Data | Owner | Lifetime |
 |------|-------|----------|
 | `sensors::calibrations[MAX_SENSORS]` | `sensors::` | Runtime (cleared on `sensors::init()`) |
-| `mesh::reports[MAX_SENSORS]` | `mesh::` | Runtime |
+| `net::reports[MAX_SENSORS]` | `net::` | Runtime |
 | `automations::rules[MAX_RULES]` | `automations::` | Runtime + EEPROM persisted |
 | `automations::states[MAX_RULES]` | `automations::` | Runtime |
 | `storage::` EEPROM/Preferences | `storage::` | Persistent |
@@ -120,7 +120,7 @@ core::loop()  [runs continuously]
 3. **Remote entities** never rebound as local (`findLocalCalib` filters `c.local`)
 4. **Stale remote slots** reclaimed only if not referenced by rules
 5. **Relay persistence** applied exactly once at boot via `applyPersistedStates()`
-6. **Mesh transport** switches: UDP (WiFi STA) ↔ ESP-NOW (AP/offline)
+6. **Transport** switches: UDP (WiFi STA) ↔ ESP-NOW (AP/offline)
 
 ---
 
@@ -131,7 +131,7 @@ core::loop()  [runs continuously]
 | `core` | Boot, WiFi, OTA, main loop, time sync | `begin()`, `loop()`, `is_connected()`, `setOtaEnabled()` |
 | `sensors` | Entity registry, sensors/actuators, remote lifecycle | `temperature()`, `relay()`, `setRelay()`, `handleDimmer()`, `onRemoteCommand()` |
 | `web` | HTTP server, API, auth, rate limit, CORS | `init()`, `handleToggleApi()`, `handleDimmerApi()`, `handleRules()` |
-| `mesh` | UDP/ESP-NOW transport, packet parsing, discovery | `init()`, `tick()`, `sendCommand()`, `sendBinaryReport()`, `sendLog()` |
+| `net` | Peer discovery/messaging, packet parsing (medium agnostic) | `init()`, `tick()`, `sendCommand()`, `sendBinaryReport()`, `sendLog()` |
 | `automations` | Rule engine (EDGE/THRESHOLD/TIME/INTERVAL) | `init()`, `tick()`, `saveRulesToEEPROM()` |
 | `storage` | EEPROM/Preferences abstraction, migration | `loadCalibration()`, `saveCalibrationSlot()`, `loadRules()` |
 | `logger` | Layered logging, UDP broadcast, remote ingest | `log()`, `logf()`, `getRecentLogsJson()`, `setSerialEnabled()` |
@@ -143,7 +143,7 @@ core::loop()  [runs continuously]
 - **Validation first**: `parseStrict*` functions reject malformed input early
 - **Rate limiting**: Sliding window + burst allowance (6 req/2s)
 - **Auth**: Optional Basic Auth (disabled by default for backward compat)
-- **Mesh parsing**: Exact-size validation, magic byte, version check, payload length check
+- **Net parsing**: Exact-size validation, magic byte, version check, payload length check
 - **UDP drain**: Bounded per tick (max 8 packets/socket/tick) to prevent loop starvation
 - **OTA integrity**: Chip-ID provisioning check (not full-image hash)
 - **Rule execution**: Cooldown, delay, pending state machine
@@ -176,9 +176,9 @@ core::loop()  [runs continuously]
 |--------|---------------|
 | 1 Entity Model | `sensors.h`, `sensors.cpp`, `storage.cpp` (CalibrationPersist) |
 | 2 Identity | `sensors.cpp` (`makeSensorUid`, `findCalibByUid`), `storage.cpp` |
-| 3 Protocol | `mesh.h`, `mesh.cpp`, `mesh.h` (Packet structs) |
-| 4 Command Delivery | `mesh.cpp` (`sendCommand`, `onRemoteCommand`), `sensors.cpp` |
-| 5 Transport Abstraction | `mesh.h/cpp` (`Transport` enum, `setTransport`) |
+| 3 Protocol | `net.h`, `net.cpp` (Packet structs) |
+| 4 Command Delivery | `net.cpp` (`sendCommand`, `onRemoteCommand`), `sensors.cpp` |
+| 5 Transport Abstraction | `transport.h/cpp` + legacy `net::Transport` mirror |
 | 7 Automations | `automations.h/cpp` |
 | 9 Persistence | `storage.h/cpp`, `config.h` (EEPROM layout) |
 | 10 Memory | All `.cpp`, `html.cpp` (payload size) |
@@ -207,7 +207,7 @@ core::loop()  [runs continuously]
 | HTML payload | ~70KB (embedded in `html.cpp`) |
 | Max sensors | 64 (40 persisted) |
 | Max rules | 20 |
-| Mesh timeout | `MESH_TIMEOUT` (default 30s) |
+| Peer timeout | `NET_TIMEOUT` (default 30s) |
 | OTA integrity | Chip-ID provisioning (not full hash) |
 
 ---
@@ -254,9 +254,9 @@ of the V2 `COMMAND` / `COMMAND_ACK` / `COMMAND_ERROR` messages.
 | `BASE_RETRY_MS` | 2000 / `RETRY_BACKOFF` 2 | Backoff 2 s → 4 s → 8 s |
 | `COMMAND_TTL_MS` | 30000 | Command dropped after 30 s unacknowledged |
 
-Flow (driven from `mesh::tick()`):
+Flow (driven from `net::tick()`):
 
-1. `sensors` actuator path → `mesh::sendReliableV2Command()` → transmit `COMMAND` (ACK_REQ) + `ReliableQueue.enqueue()`.
+1. `sensors` actuator path → `net::sendReliableV2Command()` → transmit `COMMAND` (ACK_REQ) + `ReliableQueue.enqueue()`.
 2. Inbound `COMMAND_ACK` / `COMMAND_ERROR` correlate on `msg_id` and free the slot (`onAck` / `onError`).
 3. Missed ACK → `deliveryTick()` retransmits **reusing the original `msg_id`**, backoff ×2 per attempt.
 4. Exhausted retries keep the slot until TTL, then decay with a warning.
@@ -289,8 +289,8 @@ Two fixed structs: `PendingCommand` ≈ 6 × ~20 B + `DupEntry` 12 × ~13 B ≈ 
 | File | Change |
 |------|--------|
 | `src/cmd_delivery.h` | NEW — `ReliableQueue`, `DupRing`, `AckStatus` (pure C++, host-testable) |
-| `src/protocol_v2.h`, `src/mesh.h` | `V2CommandCallback` returns `uint8_t`; `sendReliableV2Command()` decl |
-| `src/mesh.cpp` | queue/dup statics, `sendCommandFrame()` (shared msg_id), `sendReliableV2Command()`, `deliveryTick()` in `tick()`, ACK/ERROR correlation, inbound dedup + single response |
+| `src/protocol_v2.h`, `src/net.h` | `V2CommandCallback` returns `uint8_t`; `sendReliableV2Command()` decl |
+| `src/net.cpp` | queue/dup statics, `sendCommandFrame()` (shared msg_id), `sendReliableV2Command()`, `deliveryTick()` in `tick()`, ACK/ERROR correlation, inbound dedup + single response |
 | `src/sensors.h/cpp` | `onV2Command()` returns status (no internal ACK); remote actuators prefer reliable V2 when `entity_id != 0` |
 | `src/core.cpp` | periodic `sendV2Hello()` + per-entity `sendV2EntityAnnounce()` (gives remotes stable `entity_id`) |
 | `tests/host_sanity.py` | +36 command-delivery mirror tests (138/138 PASS) |
@@ -305,15 +305,15 @@ UDP and ESP-NOW primitives are now owned by a dedicated module. Everything
 above talks to a medium-agnostic channel:
 
 ```
-Application Messaging (mesh)          <- framing, protocol, entity/command logic
+Application Messaging (net)           <- framing, protocol, entity/command logic
         ↕  broadcast() / unicast() / poll()
 qymera::transport  (src/transport.h/.cpp)
-        ↕  WiFiUDP sockets / mesh::espnow_*
+        ↕  WiFiUDP sockets / qymera::espnow::*
 UDP datagrams                        ESP-NOW broadcast
 ```
 
-`mesh` no longer holds sockets (`udp`, `mesh_udp`, `cmd_udp` were removed), no
-longer branches on `espnow_is_enabled()`, and no longer touches `WiFiUdp`/
+`net` no longer holds sockets (`udp`, `mesh_udp`, `cmd_udp` were removed), no
+longer branches on `espnow::is_enabled()`, and no longer touches `WiFiUdp`/
 `espnow_*`. Nine duplicated if/else send blocks collapsed into direct
 `transport::broadcast`/`transport::unicast` calls.
 
@@ -321,13 +321,13 @@ longer branches on `espnow_is_enabled()`, and no longer touches `WiFiUdp`/
 
 | Member | Role |
 |--------|------|
-| `begin(bcast_port, cmd_port)` | bind both UDP sockets + `espnow_init()` |
-| `setActive(Kind)` / `active()` | backend selection (mirrored by legacy `mesh::setTransport`) |
+| `begin(bcast_port, cmd_port)` | bind both UDP sockets + `espnow::init()` |
+| `setActive(Kind)` / `active()` | backend selection (mirrored by legacy `net::setTransport`) |
 | `broadcast(data, len)` | UDP 255.255.255.255 / ESP-NOW broadcast |
 | `unicast(peer, data, len)` | UDP unicast; ESP-NOW → broadcast fallback (no unicast peer API) |
 | `beginPoll()` + `poll(&frame)` | drain cycle: broadcast socket → command socket → ESP-NOW FIFO |
 
-`mesh` keeps its `RemoteDevice` / `*FromIp`/`*FromUid` abstractions; peer
+`net` keeps its `RemoteDevice` / `*FromIp`/`*FromUid` abstractions; peer
 identity is passed as text (`"IPv4"` or `"AA:BB:CC:DD:EE:FF"`).
 
 ### 13.3 Guards Preserved
@@ -351,6 +351,6 @@ BSS moved into `transport.cpp`; code delta vs HEAD (Phase 4): **+600–950 B RAM
 |------|--------|
 | `src/transport.h` | NEW — `Kind`, `Peer`, `Frame`, `broadcast`/`unicast`/`poll`/`beginPoll`/`setActive` |
 | `src/transport.cpp` | NEW — owns both UDP sockets + ESP-NOW, dispatch, RX guards, `udpTxReady` |
-| `src/mesh.h` | REMOVED `<WiFiUdp.h>` / `espnow_p2p.h` includes + `extern WiFiUDP udp`; keeps legacy `Transport` enum |
-| `src/mesh.cpp` | REMOVED sockets/primitives/`parseUDPPacket`; sends via `transport::*`; tick drains via `poll()` |
+| `src/net.h` | REMOVED `<WiFiUdp.h>` / `espnow_p2p.h` includes + `extern WiFiUDP udp`; keeps legacy `Transport` enum |
+| `src/net.cpp` | REMOVED sockets/primitives/`parseUDPPacket`; sends via `transport::*`; tick drains via `poll()` |
 | `tests/host_sanity.py` | +11 transport mirror tests (149/149 PASS) |

@@ -4,7 +4,7 @@
 #include "web.h"
 #include "html.h"
 #include "core.h"
-#include "mesh.h"
+#include "net.h"
 #include "sensors.h"
 #include "automations.h"
 #include "storage.h"
@@ -768,9 +768,9 @@ ICACHE_FLASH_ATTR void handleCalib() {
   bool firstObj = true;
   for (int i = 0; i < MAX_SENSORS; i++) {
     auto &c = sensors::calibrations[i];
-    auto &r = mesh::reports[i];
+    auto &r = net::reports[i];
     // Expose only active, well-formed entries: valid uid, valid type, and
-    // remote entries that are still within MESH_TIMEOUT. Stale remote sensors,
+    // remote entries that are still within NET_TIMEOUT. Stale remote sensors,
     // SENSOR_NONE and invalid/garbage types are never reported as devices.
     if (!sensors::isEntryVisible(i)) continue;
     if (!firstObj) json += ',';
@@ -806,7 +806,7 @@ ICACHE_FLASH_ATTR void handleCalib() {
     json += ",\"type\":";            json += c.type;
     json += ",\"local\":";           json += (c.local ? "true" : "false");
     // Elapsed ms since the last remote packet, computed server-side from the
-    // same millis() timebase as MESH_TIMEOUT (client Date.now() is epoch-based
+    // same millis() timebase as NET_TIMEOUT (client Date.now() is epoch-based
     // and cannot be compared directly with the device uptime counter).
     json += ",\"age_ms\":";          json += c.local ? 0 : (uint32_t)(millis() - c.last_update);
 
@@ -856,7 +856,7 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
     return;
   }
   auto &c = sensors::calibrations[calibIdx];
-  auto &r = mesh::reports[calibIdx];
+  auto &r = net::reports[calibIdx];
   float raw = r.raw;
 
   // TIME / timezone: strict integer minutes from UTC, range -720..840.

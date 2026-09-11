@@ -6,7 +6,7 @@
 #include "automations.h"
 #include "core.h"
 #include "log.h"
-#include "mesh.h"
+#include "net.h"
 #include "sensors.h"
 
 namespace storage {

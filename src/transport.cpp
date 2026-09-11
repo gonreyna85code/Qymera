@@ -33,12 +33,12 @@ void begin(uint16_t bport, uint16_t cport) {
   command_port = cport;
   broadcast_socket.begin(broadcast_port);
   command_socket.begin(command_port);
-  mesh::espnow_init();
+  espnow::init();
 }
 
 void setActive(Kind kind) {
   active_kind = kind;
-  mesh::espnow_set_enabled(kind == Kind::ESP_NOW);
+  espnow::set_enabled(kind == Kind::ESP_NOW);
 }
 
 Kind active() {
@@ -56,7 +56,7 @@ bool broadcast(const uint8_t *data, uint16_t len) {
     broadcast_socket.write(data, len);
     broadcast_socket.endPacket();
   } else {
-    mesh::espnow_send_broadcast(data, len);
+    espnow::send_broadcast(data, len);
   }
   return true;
 }
@@ -70,7 +70,7 @@ bool unicast(const char *peer_address, const uint8_t *data, uint16_t len) {
     command_socket.endPacket();
   } else {
     // No ESP-NOW unicast peer API in this version: degrade to broadcast.
-    mesh::espnow_send_broadcast(data, len);
+    espnow::send_broadcast(data, len);
   }
   return true;
 }
@@ -136,7 +136,7 @@ bool poll(Frame &frame) {
     // rx_phase == 2: ESP-NOW FIFO (bounded by the driver).
     uint16_t len = 0;
     uint8_t src[6];
-    if (!mesh::espnow_recv(espnow_buf, &len, src)) {
+    if (!espnow::recv(espnow_buf, &len, src)) {
       rx_phase = 0;
       return false;
     }

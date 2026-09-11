@@ -20,7 +20,7 @@ The protocol is **packet-oriented**, **versioned**, and **exact-size validated**
 ## 2. Transport Abstraction
 
 The medium is isolated behind `src/transport.h` (Phase 5). Application
-messaging (`mesh`) speaks only to the abstraction:
+messaging (`net`) speaks only to the abstraction:
 
 ```cpp
 qymera::transport::broadcast(data, len);        // every peer
@@ -29,8 +29,8 @@ qymera::transport::poll(&frame);                // next inbound frame
 qymera::transport::setActive(Kind);             // UDP (0) or ESP_NOW (1)
 ```
 
-`mesh::setTransport(mesh::Transport)` (legacy API, used from `core::loop()` based
-on WiFi status) mirrors the selection:
+`net::setTransport(net::Transport)` (legacy API, kept for `core.cpp`; mirrors the selection
+based on WiFi status):
 
 | Condition | Transport |
 |-----------|-----------|
@@ -174,7 +174,7 @@ struct PacketHeaderV4 {
 
 ## 5. Validation Rules (Receiver Side)
 
-All validation in `mesh.cpp::parseBuffer()`:
+All validation in `net.cpp::parseBuffer()`:
 
 1. **Minimum length**: `len >= sizeof(PacketHeader)`
 2. **Magic byte**: `hdr.magic == 0xA5`
@@ -243,7 +243,7 @@ For each sensor packet in datagram:
 ### Request (Controller → Actuator Owner)
 
 ```cpp
-mesh::sendCommand(remote_uid, remote_ip, sensor_id, type, value, state):
+net::sendCommand(remote_uid, remote_ip, sensor_id, type, value, state):
     1. Verify remote device exists in remote_devices[]
     2. Build PacketHeaderV4 + Packet (v5 format)
     3. Send:
@@ -276,12 +276,12 @@ mesh::sendCommand(remote_uid, remote_ip, sensor_id, type, value, state):
 
 ```cpp
 bool isStaleRemote(index):
-    return (millis() - c.last_update) > MESH_TIMEOUT  // wrap-safe
+    return (millis() - c.last_update) > NET_TIMEOUT // wrap-safe
 ```
 
 ### Reclamation (`reclaimStaleSlots()`)
 
-- Runs at most once per `MESH_TIMEOUT` window
+- Runs at most once per `NET_TIMEOUT` window
 - Iterates all slots: skips local, empty, non-stale
 - **Protection**: If `automations::isIndexReferenced(index)` → keep slot (hidden)
 - Clears slot: `calibrations[i] = Calibration()`
@@ -310,9 +310,9 @@ bool isEntryVisible(index):
 ## 8. Transport Switching
 
 ```cpp
-mesh::setTransport(wifi_connected ? TRANSPORT_UDP : TRANSPORT_ESPNOW):
-    if (transport == TRANSPORT_ESPNOW) espnow_set_enabled(true)
-    else espnow_set_enabled(false)
+net::setTransport(wifi_connected ? net::TRANSPORT_UDP : net::TRANSPORT_ESPNOW):
+    if (transport == TRANSPORT_ESPNOW) espnow::set_enabled(true)
+    else espnow::set_enabled(false)
 ```
 
 Called every `core::loop()` iteration based on `wifi_connected`.
@@ -329,7 +329,7 @@ Called every `core::loop()` iteration based on `wifi_connected`.
 | `PACKET_LOG` | `1` | Log payload kind |
 | `BROADCAST_PORT` | `13345` | UDP discovery/state |
 | `COMMAND_PORT` | `13346` | UDP command delivery |
-| `MESH_TIMEOUT` | `30000` | Staleness threshold (ms) |
+| `NET_TIMEOUT` | `30000` | Staleness threshold (ms) |
 | `DISCOVERY_MAX_UDP_PACKET` | `1400` | Max UDP datagram for batching |
 | `MAX_RX_PACKETS_PER_TICK` | `8` | Max packets drained per socket per tick |
 
@@ -412,7 +412,7 @@ struct Envelope {
 | Artifact | Purpose |
 |----------|---------|
 | `src/protocol_v2.h` | Pure C++ V2 protocol definitions: `Envelope` (24 bytes, magic 0xA6), 7 message types (`HELLO`, `ENTITY_ANNOUNCE`, `STATE_UPDATE`, `COMMAND`, `COMMAND_ACK`, `COMMAND_ERROR`, `LOG`), typed payloads, CRC16 integrity, build/parse helpers, callback typedefs. |
-| `src/mesh.h/cpp` | Dual-stack parser: tries V2 first (magic 0xA6), falls back to legacy v1-v5 (magic 0xA5). V2 callbacks registered and dispatched. V2 send functions: `sendV2Hello()`, `sendV2EntityAnnounce()`, `sendV2StateUpdate()`, `sendV2Command()`, `sendV2CommandAck()`, `sendV2CommandError()`. |
+| `src/net.h/cpp` | Dual-stack parser: tries V2 first (magic 0xA6), falls back to legacy v1-v5 (magic 0xA5). V2 callbacks registered and dispatched. V2 send functions: `sendV2Hello()`, `sendV2EntityAnnounce()`, `sendV2StateUpdate()`, `sendV2Command()`, `sendV2CommandAck()`, `sendV2CommandError()`. |
 | `src/sensors.cpp` | V2 callback handlers: `onV2EntityAnnounce()` (matches by `entity_id`), `onV2StateUpdate()`, `onV2Command()` (executes local actuator, sends ACK), `onV2CommandAck()`, `onV2CommandError()`. Commands target stable `entity_id` (not legacy `uid`). |
 | `tests/host_sanity.py` | +16 Protocol V2 tests: envelope build/parse, CRC validation, magic/version/size rejection, all 7 message type round-trips (HELLO, ENTITY_ANNOUNCE 64B, STATE_UPDATE 12B, COMMAND 16B, COMMAND_ACK 12B, COMMAND_ERROR 44B, LOG 64B). Host tests: **102/102 PASS** (86 baseline + 16 new). |
 | Build matrix | All 3 environments PASS. Memory: +~256 bytes RAM (V2 structures). ESP8266 70.3% / 42.6%; ESP32 22.7% / 74.0%; ESP32-C3 21.0% / 73.1%. |
@@ -472,7 +472,7 @@ The wire ACK/ERROR already carries the original `msg_id`, so correlation works w
 
 Retry schedule: **2 s → 4 s → 8 s** (≈14 s of retransmissions), then it waits on the TTL (30 s) before being dropped and logged.
 
-State machine (driven from `mesh::tick()`, i.e. the main loop):
+State machine (driven from `net::tick()`, i.e. the main loop):
 
 1. `sendReliableV2Command()` → builds `COMMAND` with `ACK_REQ`, sends it once, `enqueue()`s `{msg_id, remote_uid, entity_id, ...}` with `attempts=1`, `next_retry=now+2 s`, `expires=now+30 s`.
 2. If the peer's `COMMAND_ACK` (or `COMMAND_ERROR`) arrives, `onAck`/`onError` frees the slot. The `COMMAND_ACK` callback is still invoked for observability.
@@ -521,8 +521,8 @@ This also removes the Phase 3 double-ACK bug: the handler no longer sends its ow
 
 ### 11.5 Where Commands Are Sent Reliably
 
-- `sensors::setRelay()` / `sensors::handleDimmer()` remote branch → `mesh::sendReliableV2Command()` when the target has a V2 `entity_id`, legacy `mesh::sendCommand()` otherwise (legacy-only peers).
-- `mesh::sendV2Command(..., ack_requested=true)` now delegates to the reliable path.
+- `sensors::setRelay()` / `sensors::handleDimmer()` remote branch → `net::sendReliableV2Command()` when the target has a V2 `entity_id`, legacy `net::sendCommand()` otherwise (legacy-only peers).
+- `net::sendV2Command(..., ack_requested=true)` now delegates to the reliable path.
 - Periodic `sendV2Hello()` + per-entity `sendV2EntityAnnounce()` (drove from `core.cpp` report block) are what give remotes a V2 `entity_id` in the first place.
 
 ### 11.6 Compatibility

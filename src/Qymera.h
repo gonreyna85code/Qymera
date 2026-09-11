@@ -12,14 +12,14 @@
     - Qymera::begin()  in setup()
     - Qymera::loop()   in loop()
 
-  The library handles: WiFi, web server, UDP mesh, automations, EEPROM.
+  The library handles: WiFi, web server, UDP networking, automations, EEPROM.
   Everything the sketch needs is exposed under `Qymera::` (including
   Qymera::setSerialEnabled()).
 */
 #include "config.h"
 #include "core.h"
 #include "sensors.h"
-#include "mesh.h"
+#include "net.h"
 #include "web.h"
 #include "automations.h"
 #include "log.h"

@@ -4,10 +4,10 @@
 // ============================================================================
 // QYMERA TRANSPORT ABSTRACTION (Phase 5)
 //
-// Pure medium-agnostic channel between the application messaging layer (mesh)
+// Pure medium-agnostic channel between the application messaging layer (net)
 // and the concrete backends (UDP datagrams / ESP-NOW broadcast).
 //
-// mesh and anything above it must never touch WiFiUdp/espnow_* or branch on
+// net and anything above it must never touch WiFiUdp/espnow_* or branch on
 // raw sockets. They use only:
 //
 //   qymera::transport::broadcast()   -> every peer
@@ -22,7 +22,7 @@
 namespace qymera {
 namespace transport {
 
-// Backend selection: the single active medium for all mesh traffic.
+// Backend selection: the single active medium for all net traffic.
 enum class Kind : uint8_t {
   UDP = 0,
   ESP_NOW = 1,
@@ -36,7 +36,7 @@ struct Peer {
 
 // Largest inbound datagram accepted (bound by the discovery batch MTU limit).
 static const uint16_t FRAME_MAX = 1400;
-// ESP-NOW frames are capped by the 802.11 vendor buffer (mesh RX contract).
+// ESP-NOW frames are capped by the 802.11 vendor buffer (net RX contract).
 static const uint16_t ESP_NOW_FRAME_MAX = 250;
 // Per-UDP-socket RX budget per poll cycle: a broadcast storm must never
 // starve loop(); leftovers are handled on the next cycle.
@@ -72,7 +72,7 @@ bool unicast(const char *peer_address, const uint8_t *data, uint16_t len);
 
 // ---- receive ----------------------------------------------------------------
 // Resets the per-socket RX budgets. Call once at the start of each drain cycle
-// (e.g. top of the mesh tick).
+// (e.g. top of the net tick).
 void beginPoll();
 
 // True while an inbound frame is available; fills `frame`. Drains the broadcast

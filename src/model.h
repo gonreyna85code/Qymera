@@ -45,7 +45,7 @@ enum class EntityCapability : uint8_t {
 enum class EntityOwnership : uint8_t {
   NONE = 0,   // empty slot
   OWNER_LOCAL,      // owned by this device
-  REMOTE      // owned by another device (mesh)
+  REMOTE      // owned by another device (net)
 };
 
 // Stable identity, independent of the runtime slot index. The internal

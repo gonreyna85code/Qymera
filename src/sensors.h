@@ -132,7 +132,7 @@ void startFade(const String &key, uint8_t pin, int from, int to, unsigned long d
 float calibrate(const String &key, float raw);
 Calibration *getCalib(const String &key);
 
-// Mesh callbacks - Procesadas por sensors.cpp
+// Net callbacks - Procesadas por sensors.cpp
 void onRemoteSensorDiscovered(
   uint32_t remote_uid,
   const char *remote_ip,

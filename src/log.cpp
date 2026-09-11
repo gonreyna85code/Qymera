@@ -1,5 +1,5 @@
 #include "log.h"
-#include "mesh.h"
+#include "net.h"
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -105,12 +105,12 @@ static void output(Layer layer, Level level, const char *msg) {
   store_to_buffer(layer, level, msg);
 
   // --- UDP broadcast ---
-  mesh::sendLog(layer, level, msg);
+  net::sendLog(layer, level, msg);
 }
 
 void logRemote(Layer layer, Level level, const char *msg) {
-  // Remote mesh logs: same filters/output as local logs, but WITHOUT the UDP
-  // broadcast (mesh::sendLog). Re-broadcasting received logs would create an
+  // Remote net logs: same filters/output as local logs, but WITHOUT the UDP
+  // broadcast (net::sendLog). Re-broadcasting received logs would create an
   // unbounded broadcast ping-pong between devices.
   if (level < min_level) return;
   if (!layer_enabled[layer]) return;

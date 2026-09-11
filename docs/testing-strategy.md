@@ -51,7 +51,7 @@
 | `sensors` | `calibrate()`, `findLocalCalib()`, `findCalibByUid()`, `isStaleRemote()`, `isEntryVisible()`, `makeSensorUid()` |
 | `web` | `parseStrictUnsigned()`, `parseStrictLong()`, `parseStrictFloat()`, `checkRateLimit()`, `checkAuth()` |
 | `automations` | `isDateInRange()`, `executeActions()` logic, rule condition evaluation |
-| `mesh` | `encodeFloat()`, `fillPacket()`, `parseBuffer()` validation logic |
+| `net` | `encodeFloat()`, `fillPacket()`, `parseBuffer()` validation logic |
 | `storage` | `CalibrationPersist` serialization, `RulesHeader` validation, migration logic |
 | `logger` | `getRecentLogsJson()`, buffer ring logic, level/layer filtering |
 | `config` | `pwmWritePin()`, `pwmReadPin()` cross-platform consistency |
@@ -109,9 +109,9 @@
 | Test | Description |
 |------|-------------|
 | Boot sequence | `begin()` → `loop()` first report → persistence load |
-| WiFi connect → services init | STA connect → NTP, mesh, web, OTA |
+| WiFi connect → services init | STA connect → NTP, net, web, OTA |
 | WiFi timeout → AP fallback | 15s timeout → AP mode, web server up |
-| Mesh transport switch | WiFi down → ESP-NOW, WiFi up → UDP |
+| Transport switch | WiFi down → ESP-NOW, WiFi up → UDP |
 | Remote discovery | Broadcast → callback → local entity created |
 | Remote stale → hidden | Timeout → `isEntryVisible` false |
 | Command delivery | UDP unicast → `onRemoteCommand` → actuator toggle |
@@ -137,7 +137,7 @@
 | Persistence | All | Reboot → state restored |
 | Factory reset | All | `/factory` → AP mode, clean config |
 | OTA | All | `/ota/toggle` → upload → verify |
-| Mesh discovery | 2+ nodes | Cross-entity visibility |
+| Peer discovery | 2+ nodes | Cross-entity visibility |
 | Remote actuator | 2+ nodes | Toggle remote relay/dimmer |
 | Remote stale | 2+ nodes | Power off remote → hidden → reclaim |
 
@@ -145,7 +145,7 @@
 
 | Test | Description |
 |------|-------------|
-| 10 nodes | Full mesh, all endpoints |
+| 10 nodes | Full peer group, all endpoints |
 | 20 nodes | Scale test |
 | 64 entities | Max entities per node |
 | 20 rules | Max rules per node |
@@ -195,11 +195,11 @@ jobs:
 
 | Utility | Purpose |
 |---------|---------|
-| `test_fixture.cpp` | Mock `sensors::calibrations`, `mesh::reports`, etc. |
+| `test_fixture.cpp` | Mock `sensors::calibrations`, `net::reports`, etc. |
 | `mock_time.cpp` | Controllable `millis()`, `time()` for deterministic tests |
 | `mock_serial.cpp` | Capture `Serial.printf` for assertions |
 | `packet_builder.py` | Generate valid/invalid test packets |
-| `mesh_simulator.py` | Simulate multi-node mesh for integration tests |
+| `net_simulator.py` | Simulate multi-node peer-group tests |
 
 ---
 
@@ -220,7 +220,7 @@ jobs:
 | Gate | Threshold |
 |------|-----------|
 | Hardware validation | ESP8266 + ESP32 + ESP32-C3 |
-| Hardware stress | 24h soak, 2-node mesh |
+| Hardware stress | 24h soak, 2-node peer group |
 | Factory reset | Verified on all 3 platforms |
 | OTA | Successful upload + boot on all 3 |
 | Memory | No leaks in 24h soak (heap stable) |
@@ -238,7 +238,7 @@ tests/
 │   ├── test_sensors.cpp
 │   ├── test_web.cpp
 │   ├── test_automations.cpp
-│   ├── test_mesh.cpp
+│   ├── test_net.cpp
 │   ├── test_storage.cpp
 │   └── test_logger.cpp
 ├── protocol/
@@ -250,7 +250,7 @@ tests/
 │   └── test_persistence.cpp
 ├── integration/
 │   ├── test_boot.cpp
-│   ├── test_mesh.cpp
+│   ├── test_net.cpp
 │   └── test_api.cpp
 └── hardware/
     ├── test_esp8266.py
@@ -294,6 +294,6 @@ pio run -e esp8266_generic || exit 1
 | Unit test coverage | 0% | ≥ 80% |
 | Protocol test coverage | 0% | 100% of packet types |
 | State machine coverage | 0% | All rule types + lifecycle |
-| Hardware test matrix | 3 platforms | 3 platforms + 2-node mesh |
+| Hardware test matrix | 3 platforms | 3 platforms + 2-node peer group |
 | Stress test duration | 0h | 24h soak |
 | CI time | ~2 min | < 10 min |

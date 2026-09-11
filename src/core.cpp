@@ -6,7 +6,7 @@
 #include "config.h"
 #include "web.h"
 #include "sensors.h"
-#include "mesh.h"
+#include "net.h"
 #include "automations.h"
 #include "storage.h"
 #include "log.h"
@@ -18,7 +18,7 @@ namespace core {
 
 static bool ota_initialized = false;
 static bool web_initialized = false;
-static bool mesh_initialized = false;
+static bool net_initialized = false;
 static bool ota_enabled = false;
 // Vars globales compartidas (no estáticas: accesibles para configuración).
 
@@ -49,9 +49,9 @@ static void startAP() {
   web::server.close();
   delay(50);
   web::server.begin();
-  if (!mesh_initialized) {
-    mesh::init();
-    mesh_initialized = true;
+  if (!net_initialized) {
+    net::init();
+    net_initialized = true;
   }
   startOtaService();
   logger::coref("AP mode '%s' started", AP_SSID);
@@ -116,9 +116,9 @@ static void checkWiFiStatus() {
     wifi_connected = true;
     sensors::initNTP();
     startOtaService();
-    if (!mesh_initialized) {
-      mesh::init();
-      mesh_initialized = true;
+    if (!net_initialized) {
+      net::init();
+      net_initialized = true;
     }
     if (!web_initialized) {
       web::init();
@@ -202,7 +202,7 @@ void begin() {
   automations::init();
 
   // Phase 2: Network startup
-  // Network-dependent services (mesh, web, OTA) are initialized only when
+  // Network-dependent services (net, web, OTA) are initialized only when
   // WiFi is connected (in checkWiFiStatus()) or in AP mode (in startAP())
   // This prevents xQueueSemaphoreTake assert on ESP32 boot
   startWiFi();
@@ -248,7 +248,7 @@ bool isOtaEnabled() {
 // ================= LOOP PRINCIPAL ===================
 
 /// Bucle de la aplicación: maneja HTTP, reconexión Wi-Fi si cae,
-/// reportes periódicos y tareas de sensores/mesh/automáticas.
+/// reportes periódicos y tareas de sensores/net/automáticas.
 void loop() {
   /// 1) Manejo del servidor web (solo cuando está inicializado).
   if (web_initialized) {
@@ -266,11 +266,11 @@ void loop() {
   }
 
   /// Si no hay red, usar ESP-NOW; si hay red, usar UDP
-  mesh::setTransport(wifi_connected ? mesh::TRANSPORT_UDP : mesh::TRANSPORT_ESPNOW);
+  net::setTransport(wifi_connected ? net::TRANSPORT_UDP : net::TRANSPORT_ESPNOW);
 
   /// 4) Primera iteración: reporte inicial + carga de configuración persistente.
   //     Los estados persistentes se aplican justo después del primer reporte
-  //     (que registra las entidades) y ANTES de cualquier announce de mesh.
+  //     (que registra las entidades) y ANTES de cualquier announce de net.
   if (first_report) {
     Qymera::report();
     sensors::ensureTimeRegistered();
@@ -280,9 +280,9 @@ void loop() {
     last_report = millis();
   }
 
-  /// 4) Tareas periódicas: clock NTP, mesh tick, automatización.
+  /// 4) Tareas periódicas: clock NTP, net tick, automatización.
   sensors::updateNTPTime();
-  mesh::tick(millis());
+  net::tick(millis());
   sensors::reclaimStaleSlots();
   automations::tick(millis());
   sensors::applyFades();
@@ -292,13 +292,13 @@ void loop() {
   if (millis() - last_report >= genset.report_interval) {
     last_report = millis();
     Qymera::report();
-    mesh::sendBinaryReport();
+    net::sendBinaryReport();
     // V2 discovery (Phase 3/4): advertise capabilities and stable entity ids so
     // peers can route actuator commands through the reliable V2 path. Coexists
     // with the legacy broadcast for older fleet members.
-    mesh::sendV2Hello();
+    net::sendV2Hello();
     for (int i = 0; i < MAX_SENSORS; i++) {
-      mesh::sendV2EntityAnnounce(i);
+      net::sendV2EntityAnnounce(i);
     }
   }
 
