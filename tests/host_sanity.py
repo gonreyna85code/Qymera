@@ -723,6 +723,155 @@ check("outside window not dup", not r.is_duplicate(0xAAA, 7, 1000 + DUP_WINDOW_M
 r.record(0xCCC, 9, ST_BUSY, 3000)
 check("statusFor returns stored BUSY", r.status_for(0xCCC, 9, 3200) == ST_BUSY)
 
+# ---------------------------------------------------------------- transport
+# transport.h/cpp: medium-agnostic channel. Mirrors the dispatch policy and the
+# RX drain state machine (per-socket budget, source order, oversized drop).
+class FakeSocket:
+    def __init__(self):
+        self.frames = []  # list of (payload, peer)
+
+    def feed(self, payload, peer="192.168.1.50"):
+        self.frames.append((payload, peer))
+
+
+class FakeEspnow:
+    def __init__(self):
+        self.frames = []  # list of (payload, mac)
+        self.enabled = False
+
+    def feed(self, payload, mac="AA:BB:CC:DD:EE:01"):
+        self.frames.append((payload, mac))
+
+    def send(self, payload):
+        self.tx_log.append(("espnow:broadcast", payload))
+
+
+class HostTransport:
+    RECV_BUDGET = 8
+
+    def __init__(self):
+        self.kind = "UDP"
+        self.socket_broadcast = FakeSocket()
+        self.socket_command = FakeSocket()
+        self.espnow = FakeEspnow()
+        self.espnow.tx_log = []
+        self.tx_log = []
+        self.budgets = [self.RECV_BUDGET, self.RECV_BUDGET]
+        self.phase = 0
+
+    def set_active(self, kind):
+        self.kind = kind
+        self.espnow.enabled = (kind == "ESP_NOW")
+
+    def broadcast(self, payload):
+        if self.kind == "UDP":
+            self.tx_log.append(("udp:broadcast", len(payload)))
+        else:
+            self.espnow.tx_log.append(("espnow:broadcast", len(payload)))
+
+    def unicast(self, peer, payload):
+        if self.kind == "UDP":
+            self.tx_log.append(("udp:" + peer, len(payload)))
+        else:
+            self.espnow.tx_log.append(("espnow:broadcast", len(payload)))
+
+    def begin_poll(self):
+        self.budgets = [self.RECV_BUDGET, self.RECV_BUDGET]
+        self.phase = 0
+
+    def _read_socket(self, socket, idx):
+        if len(socket.frames) == 0:
+            return None
+        payload, peer = socket.frames.pop(0)
+        if self.budgets[idx] > 0:
+            self.budgets[idx] -= 1
+            return (payload, peer)
+        return None
+
+    def poll(self):
+        while True:
+            if self.phase == 0:
+                if self.budgets[0] == 0:
+                    self.phase = 1
+                    continue
+                r = self._read_socket(self.socket_broadcast, 0)
+                if r is None:
+                    self.phase = 1
+                    continue
+                return r
+            if self.phase == 1:
+                if self.budgets[1] == 0:
+                    self.phase = 2
+                    continue
+                r = self._read_socket(self.socket_command, 1)
+                if r is None:
+                    self.phase = 2
+                    continue
+                return r
+            if len(self.espnow.frames) == 0:
+                self.phase = 0
+                return None
+            payload, mac = self.espnow.frames.pop(0)
+            return (payload, mac)
+
+
+print("[transport dispatch]")
+t = HostTransport()
+t.broadcast(b"x")
+t.unicast("10.0.0.7", b"y")
+check("UDP broadcast -> udp:broadcast", t.tx_log[0][0] == "udp:broadcast")
+check("UDP unicast -> udp:<peer>",
+      t.tx_log[1] == ("udp:10.0.0.7", 1) and t.tx_log[1][0].startswith("udp:"))
+t.set_active("ESP_NOW")
+check("setActive enables espnow", t.espnow.enabled)
+t.broadcast(b"a")
+t.unicast("10.0.0.7", b"b")
+check("ESP-NOW broadcast -> espnow:broadcast", t.espnow.tx_log[0][0] == "espnow:broadcast")
+check("ESP-NOW unicast degrades to broadcast (doc'ed limitation)",
+      t.espnow.tx_log[1][0] == "espnow:broadcast")
+t.set_active("UDP")
+check("setActive back to UDP disables espnow", not t.espnow.enabled)
+
+print("[transport rx drain]")
+t = HostTransport()
+for i in range(3):
+    t.socket_broadcast.feed(b"b%d" % i, "10.0.0.1")
+for i in range(2):
+    t.socket_command.feed(b"c%d" % i, "10.0.0.2")
+t.espnow.feed(b"e0", "AA:BB:CC:DD:EE:01")
+t.espnow.feed(b"e1", "AA:BB:CC:DD:EE:02")
+t.begin_poll()
+seq = []
+while True:
+    f = t.poll()
+    if f is None:
+        break
+    seq.append(f[0])
+check("drain order: broadcast, then command, then esp-now",
+      seq == [b"b0", b"b1", b"b2", b"c0", b"c1", b"e0", b"e1"])
+check("empty cycle returns None", t.poll() is None)
+
+t = HostTransport()
+for i in range(9):
+    t.socket_broadcast.feed(b"z%d" % i, "10.0.0.1")
+for i in range(2):
+    t.socket_command.feed(b"y%d" % i, "10.0.0.2")
+t.begin_poll()
+seq = []
+while True:
+    f = t.poll()
+    if f is None:
+        break
+    seq.append(f[0])
+check("broadcast budget capped at RECV_BUDGET (8), per-socket",
+      seq[:8] == [b"z%d" % i for i in range(8)])
+check("broadcast storm stops at 8 while command socket still drains",
+      len(seq) == 10 and seq[8:10] == [b"y0", b"y1"])
+# from remaining 1 broadcast frame, command had nothing more -> next cycle drains leftover
+t.begin_poll()
+leftover = t.poll()
+check("leftover drained after begin_poll", leftover == (b"z8", "10.0.0.1"))
+
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)

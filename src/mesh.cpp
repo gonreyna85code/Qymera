@@ -5,6 +5,7 @@
 #include "log.h"
 #include "model.h"
 #include "cmd_delivery.h"
+#include "transport.h"
 
 namespace mesh {
 
@@ -18,15 +19,12 @@ static_assert(sizeof(PacketV4) == 47, "PacketV4 must be 47 bytes");
 static_assert(sizeof(Packet) == 58, "Packet must be 58 bytes");
 static_assert(sizeof(LogPacket) == 66, "LogPacket must be 66 bytes");
 
-WiFiUDP udp;
 ReportEntry reports[MAX_SENSORS];
 float MIN_VAL = -50.0f;
 float MAX_VAL = 150.0f;
 static RemoteDevice remote_devices[MAX_SENSORS];
 static int remote_device_count = 0;
 static unsigned long last_cleanup = 0;
-static WiFiUDP mesh_udp;
-static WiFiUDP cmd_udp;
 static SensorDiscoveryCallback sensor_callback = nullptr;
 static CommandCallback command_cb = nullptr;
 
@@ -49,31 +47,26 @@ static qymera::delivery::DupRing cmd_dup_ring;
 static void deliveryTick(uint32_t now_ms);
 
 // ================= TRANSPORT =================
-static Transport transport = TRANSPORT_UDP;
+// The selected medium lives in qymera::transport. mesh only mirrors it for the
+// legacy mesh::setTransport/getTransport API (core.cpp selects WiFi vs AP mode).
 
 void setTransport(Transport t) {
-  if (t == transport) return;
-  transport = t;
-  espnow_set_enabled(t == TRANSPORT_ESPNOW);
-  logger::coref("Mesh transport: %s", t == TRANSPORT_ESPNOW ? "ESP-NOW" : "UDP");
+  qymera::transport::setActive(
+    t == TRANSPORT_ESPNOW ? qymera::transport::Kind::ESP_NOW
+                          : qymera::transport::Kind::UDP);
+  logger::coref("Mesh transport: %s",
+                t == TRANSPORT_ESPNOW ? "ESP-NOW" : "UDP");
 }
 
 Transport getTransport() {
-  return transport;
+  return qymera::transport::active() == qymera::transport::Kind::ESP_NOW
+           ? TRANSPORT_ESPNOW
+           : TRANSPORT_UDP;
 }
 
 void init() {
-  mesh_udp.begin(core::genset.broadcast_port);
-  udp.begin(core::genset.command_port);
-  espnow_init();
-}
-
-static bool udpTxReady() {
-#if defined(ESP32)
-  return WiFi.getMode() != WIFI_MODE_NULL;
-#else
-  return true;
-#endif
+  qymera::transport::begin(core::genset.broadcast_port,
+                           core::genset.command_port);
 }
 
 void setSensorDiscoveryCallback(SensorDiscoveryCallback cb) {
@@ -386,61 +379,15 @@ static void parseBuffer(const uint8_t *buf, uint16_t len, const char *remote_ip,
   }
 }
 
-// ================= UDP PARSER =================
-
-static void parseUDPPacket(WiFiUDP &socket, uint32_t now_ms) {
-  // RX buffer must hold the largest configured discovery batch.
-  static uint8_t buf[DISCOVERY_MAX_UDP_PACKET];
-  int processed = 0;
-  int packet_size;
-  // Drain up to MAX_RX_PACKETS_PER_TICK datagrams per socket per tick. A UDP
-  // storm must not monopolize loop(); leftovers are handled on the next tick().
-  while (processed < MAX_RX_PACKETS_PER_TICK && (packet_size = socket.parsePacket()) > 0) {
-    // Reject oversized/malformed datagrams: a payload larger than our buffer
-    // cannot be fully drained and would otherwise leave stale bytes that
-    // parsePacket() re-yields every tick -> an infinite spin. Drop-and-drain.
-    if (packet_size > (int)sizeof(buf)) {
-      while (socket.available()) socket.read();
-      break;
-    }
-    int len = socket.read(buf, sizeof(buf));
-    if (len <= 0) {
-      // parsePacket() reported a datagram but read() could not retrieve it
-      // (e.g. WiFi reconnecting, socket in a transitional state). Drain the
-      // pending bytes and stop this tick; retry on the next tick. This prevents
-      // the loop from re-yielding the same unreadable datagram forever.
-      while (socket.available()) socket.read();
-      break;
-    }
-    char remote_ip[16];
-    IPAddress rip = socket.remoteIP();
-    snprintf(remote_ip, sizeof(remote_ip), "%d.%d.%d.%d", rip[0], rip[1], rip[2], rip[3]);
-    parseBuffer(buf, len, remote_ip, now_ms);
-    // Guarantee the datagram is fully dequeued. On ESP32 a socket can re-yield
-    // the same datagram across ticks if the leading read() does not consume it
-    // entirely, which would spin loop() at full speed (log flood + stale mesh).
-    // available()==0 here in the normal case (no-op); this just closes the gap.
-    while (socket.available()) socket.read();
-    processed++;
-  }
-}
-
 // ================= TICK =================
 
 void tick(uint32_t now_ms) {
-  if (transport == TRANSPORT_UDP) {
-    parseUDPPacket(mesh_udp, now_ms);
-    parseUDPPacket(udp, now_ms);
-  } else if (transport == TRANSPORT_ESPNOW) {
-    uint8_t buf[250];
-    uint16_t len;
-    uint8_t src[6];
-    while (espnow_recv(buf, &len, src)) {
-      char mac_str[24];
-      snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-        src[0], src[1], src[2], src[3], src[4], src[5]);
-      parseBuffer(buf, len, mac_str, now_ms);
-    }
+  // Drain the active backend through the transport abstraction. The RX budgets
+  // (per-socket storm throttle) and medium guards live in transport::poll().
+  qymera::transport::beginPoll();
+  qymera::transport::Frame frame;
+  while (qymera::transport::poll(frame)) {
+    parseBuffer(frame.data, frame.len, frame.peer.address, now_ms);
   }
 
   // Phase 4: retransmit unacked commands with backoff, expire TTLs.
@@ -502,13 +449,7 @@ void sendCommand(uint32_t remote_uid, const char *remote_ip, uint32_t sensor_id,
   memcpy(buf, &hdr, sizeof(hdr));
   memcpy(buf + sizeof(hdr), &pkt, sizeof(pkt));
 
-  if (transport == TRANSPORT_UDP) {
-    cmd_udp.beginPacket(remote_ip, core::genset.command_port);
-    cmd_udp.write(buf, sizeof(buf));
-    cmd_udp.endPacket();
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, sizeof(buf));
-  }
+  qymera::transport::unicast(remote_ip, buf, sizeof(buf));
 }
 
 static void fillPacket(const sensors::Calibration &c, Packet &pkt) {
@@ -544,15 +485,11 @@ static void sendUdpBatch(uint8_t *buf, int sensor_count) {
   hdr.kind = PACKET_SENSOR;
   hdr.size = sizeof(PacketHeaderV4) + sensor_count * sizeof(Packet);
   memcpy(buf, &hdr, sizeof(hdr));
-  if (udpTxReady()) {
-    udp.beginPacket("255.255.255.255", core::genset.broadcast_port);
-    udp.write(buf, hdr.size);
-    udp.endPacket();
-  }
+  qymera::transport::broadcast(buf, hdr.size);
 }
 
 void sendBinaryReport() {
-  if (transport == TRANSPORT_UDP) {
+  if (qymera::transport::active() == qymera::transport::Kind::UDP) {
     // Batching: group local entities into datagrams of up to
     // DISCOVERY_MAX_UDP_PACKET bytes. Only local entities are announced.
     static uint8_t batch[DISCOVERY_MAX_UDP_PACKET];
@@ -572,7 +509,7 @@ void sendBinaryReport() {
       sensor_count++;
     }
     sendUdpBatch(batch, sensor_count);
-  } else if (espnow_is_enabled()) {
+  } else {
     // ESP-NOW: one entity per broadcast (RX side uses a 250-byte buffer).
     for (int i = 0; i < MAX_SENSORS; i++) {
       auto &c = sensors::calibrations[i];
@@ -588,7 +525,7 @@ void sendBinaryReport() {
       uint8_t buf[sizeof(PacketHeaderV4) + sizeof(Packet)];
       memcpy(buf, &hdr, sizeof(hdr));
       memcpy(buf + sizeof(hdr), &pkt, sizeof(pkt));
-      espnow_send_broadcast(buf, sizeof(buf));
+      qymera::transport::broadcast(buf, sizeof(buf));
     }
   }
 }
@@ -611,31 +548,10 @@ void sendLog(uint8_t layer, uint8_t level, const char *message) {
   memcpy(buf, &hdr, sizeof(hdr));
   memcpy(buf + sizeof(hdr), &pkt, sizeof(pkt));
 
-  if (transport == TRANSPORT_UDP) {
-    if (udpTxReady()) {
-      udp.beginPacket("255.255.255.255", core::genset.broadcast_port);
-      udp.write(buf, sizeof(buf));
-      udp.endPacket();
-    }
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, sizeof(buf));
-  }
+  qymera::transport::broadcast(buf, sizeof(buf));
 }
 
 // ================= PROTOCOL V2 SENDS =================
-
-static void v2SendUDP(const uint8_t *buf, uint16_t len) {
-  if (!udpTxReady()) return;
-  udp.beginPacket("255.255.255.255", core::genset.broadcast_port);
-  udp.write(buf, len);
-  udp.endPacket();
-}
-
-static void v2SendCommandUDP(const uint8_t *buf, uint16_t len, const char *remote_ip) {
-  cmd_udp.beginPacket(remote_ip, core::genset.command_port);
-  cmd_udp.write(buf, len);
-  cmd_udp.endPacket();
-}
 
 void sendV2Hello() {
   using namespace qymera::protocol::v2;
@@ -654,11 +570,7 @@ void sendV2Hello() {
                                   &hp, sizeof(hp));
   if (frame_len == 0) return;
 
-  if (transport == TRANSPORT_UDP) {
-    v2SendUDP(buf, frame_len);
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, frame_len);
-  }
+  qymera::transport::broadcast(buf, frame_len);
 }
 
 void sendV2EntityAnnounce(uint8_t index) {
@@ -700,11 +612,7 @@ void sendV2EntityAnnounce(uint8_t index) {
                                   &eap, sizeof(eap));
   if (frame_len == 0) return;
 
-  if (transport == TRANSPORT_UDP) {
-    v2SendUDP(buf, frame_len);
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, frame_len);
-  }
+  qymera::transport::broadcast(buf, frame_len);
 }
 
 void sendV2StateUpdate(uint8_t index) {
@@ -729,11 +637,7 @@ void sendV2StateUpdate(uint8_t index) {
                                   &sup, sizeof(sup));
   if (frame_len == 0) return;
 
-  if (transport == TRANSPORT_UDP) {
-    v2SendUDP(buf, frame_len);
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, frame_len);
-  }
+  qymera::transport::broadcast(buf, frame_len);
 }
 
 // Shared V2 COMMAND sender used by the one-shot path, the reliable path and
@@ -749,12 +653,7 @@ static void sendCommandFrame(uint32_t msg_id, uint32_t remote_uid,
                                   msg_id, flags, &cp, sizeof(cp));
   if (frame_len == 0) return;
 
-  if (transport == TRANSPORT_UDP) {
-    v2SendCommandUDP(buf, frame_len, remote_ip);
-  } else if (espnow_is_enabled()) {
-    // ESP-NOW: broadcast (no unicast)
-    espnow_send_broadcast(buf, frame_len);
-  }
+  qymera::transport::unicast(remote_ip, buf, frame_len);
 }
 
 void sendV2Command(uint32_t remote_uid, const char *remote_ip,
@@ -852,11 +751,7 @@ void sendV2CommandAck(uint32_t remote_uid, const char *remote_ip,
                                   &cap, sizeof(cap));
   if (frame_len == 0) return;
 
-  if (transport == TRANSPORT_UDP) {
-    v2SendCommandUDP(buf, frame_len, remote_ip);
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, frame_len);
-  }
+  qymera::transport::unicast(remote_ip, buf, frame_len);
 }
 
 void sendV2CommandError(uint32_t remote_uid, const char *remote_ip,
@@ -876,11 +771,7 @@ void sendV2CommandError(uint32_t remote_uid, const char *remote_ip,
                                   &cep, sizeof(cep));
   if (frame_len == 0) return;
 
-  if (transport == TRANSPORT_UDP) {
-    v2SendCommandUDP(buf, frame_len, remote_ip);
-  } else if (espnow_is_enabled()) {
-    espnow_send_broadcast(buf, frame_len);
-  }
+  qymera::transport::unicast(remote_ip, buf, frame_len);
 }
 
 }  // namespace mesh

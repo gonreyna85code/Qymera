@@ -294,3 +294,63 @@ Two fixed structs: `PendingCommand` ≈ 6 × ~20 B + `DupEntry` 12 × ~13 B ≈ 
 | `src/sensors.h/cpp` | `onV2Command()` returns status (no internal ACK); remote actuators prefer reliable V2 when `entity_id != 0` |
 | `src/core.cpp` | periodic `sendV2Hello()` + per-entity `sendV2EntityAnnounce()` (gives remotes stable `entity_id`) |
 | `tests/host_sanity.py` | +36 command-delivery mirror tests (138/138 PASS) |
+
+---
+
+## 13. Transport Abstraction (Phase 5)
+
+### 13.1 Layering
+
+UDP and ESP-NOW primitives are now owned by a dedicated module. Everything
+above talks to a medium-agnostic channel:
+
+```
+Application Messaging (mesh)          <- framing, protocol, entity/command logic
+        ↕  broadcast() / unicast() / poll()
+qymera::transport  (src/transport.h/.cpp)
+        ↕  WiFiUDP sockets / mesh::espnow_*
+UDP datagrams                        ESP-NOW broadcast
+```
+
+`mesh` no longer holds sockets (`udp`, `mesh_udp`, `cmd_udp` were removed), no
+longer branches on `espnow_is_enabled()`, and no longer touches `WiFiUdp`/
+`espnow_*`. Nine duplicated if/else send blocks collapsed into direct
+`transport::broadcast`/`transport::unicast` calls.
+
+### 13.2 API
+
+| Member | Role |
+|--------|------|
+| `begin(bcast_port, cmd_port)` | bind both UDP sockets + `espnow_init()` |
+| `setActive(Kind)` / `active()` | backend selection (mirrored by legacy `mesh::setTransport`) |
+| `broadcast(data, len)` | UDP 255.255.255.255 / ESP-NOW broadcast |
+| `unicast(peer, data, len)` | UDP unicast; ESP-NOW → broadcast fallback (no unicast peer API) |
+| `beginPoll()` + `poll(&frame)` | drain cycle: broadcast socket → command socket → ESP-NOW FIFO |
+
+`mesh` keeps its `RemoteDevice` / `*FromIp`/`*FromUid` abstractions; peer
+identity is passed as text (`"IPv4"` or `"AA:BB:CC:DD:EE:FF"`).
+
+### 13.3 Guards Preserved
+
+The RX storm-throttle and the ESP32 re-yield protections moved verbatim into
+`transport::poll()`:
+
+- `RECV_BUDGET` = 8 per UDP socket per poll cycle (drain cap, per socket);
+- oversized datagram → drop-and-drain, stop that socket this cycle;
+- `read()` failure → drain and stop that socket this cycle.
+
+### 13.4 Cost
+
+Statics: 2×`WiFiUDP` (moved) + `rx_buf[1400]` + `espnow_buf[250]` ≈ +~1.8 KB
+BSS moved into `transport.cpp`; code delta vs HEAD (Phase 4): **+600–950 B RAM,
+-1.8 .. +2.1 KB flash** (linker-dependent).
+
+### 13.5 Files
+
+| File | Change |
+|------|--------|
+| `src/transport.h` | NEW — `Kind`, `Peer`, `Frame`, `broadcast`/`unicast`/`poll`/`beginPoll`/`setActive` |
+| `src/transport.cpp` | NEW — owns both UDP sockets + ESP-NOW, dispatch, RX guards, `udpTxReady` |
+| `src/mesh.h` | REMOVED `<WiFiUdp.h>` / `espnow_p2p.h` includes + `extern WiFiUDP udp`; keeps legacy `Transport` enum |
+| `src/mesh.cpp` | REMOVED sockets/primitives/`parseUDPPacket`; sends via `transport::*`; tick drains via `poll()` |
+| `tests/host_sanity.py` | +11 transport mirror tests (149/149 PASS) |

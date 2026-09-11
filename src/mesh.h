@@ -1,8 +1,6 @@
 #pragma once
-#include <WiFiUdp.h>
 #include <Arduino.h>
 #include "config.h"
-#include "espnow_p2p.h"
 #include "protocol_v2.h"
 
 namespace mesh {
@@ -95,7 +93,6 @@ struct ReportEntry {
 };
 
 extern ReportEntry reports[MAX_SENSORS];
-extern WiFiUDP udp;
 
 // ============================================================================
 // Protocolo
@@ -275,9 +272,5 @@ bool isDeviceOnline(uint32_t uid);
 // avoid IP fragmentation: sizeof(PacketHeaderV4)=9 and sizeof(Packet)=58, so
 // up to floor((1400-9)/58)=23 sensors fit per datagram.
 #define DISCOVERY_MAX_UDP_PACKET 1400
-
-// UDP RX drain cap per socket per tick: a broadcast storm must never starve
-// loop(). Datagrams beyond this cap are handled on the next tick().
-#define MAX_RX_PACKETS_PER_TICK 8
 
 }  // namespace mesh

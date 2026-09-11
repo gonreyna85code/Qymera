@@ -19,20 +19,27 @@ The protocol is **packet-oriented**, **versioned**, and **exact-size validated**
 
 ## 2. Transport Abstraction
 
-```cpp
-enum Transport {
-    TRANSPORT_UDP,      // WiFi STA connected
-    TRANSPORT_ESPNOW    // AP mode or WiFi disconnected
-};
+The medium is isolated behind `src/transport.h` (Phase 5). Application
+messaging (`mesh`) speaks only to the abstraction:
 
-mesh::setTransport(Transport);  // Called from core::loop() based on WiFi status
+```cpp
+qymera::transport::broadcast(data, len);        // every peer
+qymera::transport::unicast(peer, data, len);    // UDP unicast / ESP-NOW broadcast fallback
+qymera::transport::poll(&frame);                // next inbound frame
+qymera::transport::setActive(Kind);             // UDP (0) or ESP_NOW (1)
 ```
+
+`mesh::setTransport(mesh::Transport)` (legacy API, used from `core::loop()` based
+on WiFi status) mirrors the selection:
 
 | Condition | Transport |
 |-----------|-----------|
 | WiFi STA connected | UDP Broadcast |
 | WiFi AP mode | ESP-NOW |
 | WiFi disconnected (retrying) | ESP-NOW |
+
+Frame caps and storm throttle are transport-owned: `FRAME_MAX` = 1400,
+`ESP_NOW_FRAME_MAX` = 250, `RECV_BUDGET` = 8 per UDP socket per poll cycle.
 
 ---
 
