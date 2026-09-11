@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-11  
 **Branch:** main  
-**Commit:** `TBD` (after commit)  
+**Commit:** `d90d92d` (pushed to origin/main `67fa8e8..d90d92d`)  
 **Supersedes terminology in:** audits/phase-04, audits/phase-05 (historical records kept)
 
 ---
