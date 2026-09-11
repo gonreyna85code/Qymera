@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-11  
 **Branch:** main  
-**Commit:** `TBD` (after commit)  
+**Commit:** `503c728` (pushed to origin/main `0ddfc1c..503c728`)  
 **Auditor:** Automated baseline inspection
 
 ---
