@@ -82,7 +82,69 @@ struct RulesHeader {
 };
 
 static const uint32_t RULES_MAGIC = 0x4155544F;  // "AUTO"
-static const uint16_t RULES_VERSION = 1;
+static const uint16_t RULES_VERSION = 2;
+
+struct LegacyRule {
+  uint8_t sensor_idxs[5];
+  uint8_t sensor_count;
+  uint8_t type;
+  uint8_t cmp[5];
+  int16_t threshold[5];
+  uint8_t logical_and;
+  uint8_t actuator_idxs[5];
+  uint8_t actions[5];
+  uint8_t levels[5];
+  uint8_t actuator_count;
+  uint16_t delay_ms;
+  uint32_t cooldown_ms;
+  uint32_t time_s;
+  uint32_t interval_ms;
+  uint16_t year_start;
+  uint16_t year_end;
+  uint8_t month_start;
+  uint8_t month_end;
+  uint8_t day_start;
+  uint8_t day_end;
+};
+
+static automations::Automation migrateLegacy(const LegacyRule &lr) {
+  using namespace automations;
+  Automation a{};
+  a.kind = (lr.type <= 1) ? ON_SAMPLE : (lr.type == 2 ? ON_TIME : ON_INTERVAL);
+  a.sensor_count = lr.sensor_count;
+  a.actuator_count = lr.actuator_count;
+  a.debounce_ms = (lr.type == 0) ? 150 : 0;
+  a.fire_delay_ms = lr.delay_ms;
+  a.cooldown_ms = lr.cooldown_ms;
+  a.time_s = lr.time_s;
+  a.interval_ms = lr.interval_ms;
+  a.year_start = lr.year_start;
+  a.year_end = lr.year_end;
+  a.month_start = lr.month_start;
+  a.month_end = lr.month_end;
+  a.day_start = lr.day_start;
+  a.day_end = lr.day_end;
+  for (int j = 0; j < 5; j++) {
+    a.c_sensor[j] = lr.sensor_idxs[j];
+    a.c_threshold[j] = lr.threshold[j];
+    if (a.kind == ON_SAMPLE) {
+      if (lr.type == 0) {
+        a.c_cmp[j] = (lr.cmp[j] == 1) ? EDGE_FALLING : EDGE_RISING;
+      } else {
+        a.c_cmp[j] = lr.cmp[j];
+      }
+    } else {
+      a.c_cmp[j] = CMP_GT;
+    }
+    if (j < 4) {
+      a.c_op_bits |= ((lr.logical_and ? JOIN_AND : JOIN_OR) & 1) << j;
+    }
+    a.a_sensor[j] = lr.actuator_idxs[j];
+    a.a_action[j] = lr.actions[j];
+    a.a_level[j] = lr.levels[j];
+  }
+  return a;
+}
 
 // Entity ID map helpers (slot_index -> entity_id)
 static inline int entityIdMapAddr(int slot) {
@@ -309,14 +371,30 @@ void loadRules() {
   int addr = EEPROM_RULES_START;
   get(addr, h);
   addr += sizeof(RulesHeader);
-  if (h.magic != RULES_MAGIC || h.version != RULES_VERSION) {
+  if (h.magic != RULES_MAGIC) {
     memset(automations::rules, 0, sizeof(automations::rules));
     return;
   }
-  for (int i = 0; i < MAX_RULES; i++) {
-    get(addr, automations::rules[i]);
-    addr += sizeof(automations::Rule);
+  if (h.version == RULES_VERSION) {
+    for (int i = 0; i < MAX_RULES; i++) {
+      get(addr, automations::rules[i]);
+      addr += sizeof(automations::Automation);
+    }
+    return;
   }
+  if (h.version == 1) {
+    LegacyRule legacy[MAX_RULES];
+    for (int i = 0; i < MAX_RULES; i++) {
+      get(addr, legacy[i]);
+      addr += sizeof(LegacyRule);
+    }
+    for (int i = 0; i < MAX_RULES; i++) {
+      automations::rules[i] = migrateLegacy(legacy[i]);
+    }
+    saveRules();
+    return;
+  }
+  memset(automations::rules, 0, sizeof(automations::rules));
 }
 
 void saveRules() {
@@ -335,13 +413,13 @@ void saveRules() {
   }
   addr += sizeof(RulesHeader);
   for (int i = 0; i < MAX_RULES; i++) {
-    automations::Rule stored;
+    automations::Automation stored;
     get(addr, stored);
-    if (memcmp(&automations::rules[i], &stored, sizeof(automations::Rule)) != 0) {
+    if (memcmp(&automations::rules[i], &stored, sizeof(automations::Automation)) != 0) {
       dirty = true;
       put(addr, automations::rules[i]);
     }
-    addr += sizeof(automations::Rule);
+    addr += sizeof(automations::Automation);
   }
   if (dirty) commit();
 }

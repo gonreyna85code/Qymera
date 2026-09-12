@@ -122,6 +122,26 @@ core::loop()  [runs continuously]
 5. **Relay persistence** applied exactly once at boot via `applyPersistedStates()`
 6. **Transport** switches: UDP (WiFi STA) ↔ ESP-NOW (AP/offline)
 
+### Automation Engine 2.0 (Phase 7)
+
+Each automation is a fixed 80-byte `automations::Automation` (EEPROM v2,
+`RULES_VERSION` = 2). The model separates concerns:
+
+- **Trigger** (`kind`): `ON_SAMPLE` (edge or threshold), `ON_TIME`, `ON_INTERVAL`.
+- **Conditions** (≤5): sensor slot + comparator (`CMP_GT/LT/EQ`, `EDGE_RISING/FALLING`)
+  + threshold; per-condition debounce (`debounce_ms`) and per-automation hysteresis
+  (`c_hys_dec`, 0.1-unit band: GT engages above th, releases below th−hys; LT is the mirror).
+- **Condition tree** (`c_op_bits`): explicit AND/OR join between adjacent conditions,
+  evaluated left-associative. The legacy boolean `logical_and` is derived from ops.
+- **Actions** (≤5): sensor slot + command (`ACT_ON/OFF/TOGGLE/LEVEL`) + level.
+- **Execution policy**: fire-once-per-window-entry; optional `for_ms` sustained-duration
+  window; `fire_delay_ms` (rename of legacy `delay_ms`); `cooldown_ms` between launches;
+  `step_ms` sequencing gap between actions; per-action `retry_max`/`retry_interval_s`.
+
+States are runtime-only (`automations::states`): debounce counters, hysteresis
+occupancy bits, window/debounce/delay timers, sequence and retry bookkeeping.
+`storage::loadRules()` migrates EEPROM v1 rules in RAM and rewrites them as v2.
+
 ---
 
 ## 6. Module Responsibilities

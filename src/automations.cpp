@@ -5,70 +5,79 @@
 
 namespace automations {
 
-struct RulesHeader {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t count;
-};
+// ----------------- REGLAS -----------------
 
-static const uint32_t RULES_MAGIC = 0x4155544F;  // "AUTO"
-static const uint16_t RULES_VERSION = 1;
-
-static const uint8_t CONFIRM_READS = 3;
 static const uint32_t SAMPLE_MS = 50;
 static uint32_t last_run = 0;
 
-// ----------------- REGLAS -----------------
-struct RuleState {
-  bool stable[5];
-  bool last[5];
-  uint8_t counter[5];
-  bool pending;
-  uint32_t trigger_time;
-  uint32_t last_action;
-  uint32_t last_time_exec;
-  uint32_t last_interval_exec;
-};
-
-Rule rules[MAX_RULES];
-static RuleState states[MAX_RULES];
+Automation rules[MAX_RULES];
+AutomationState states[MAX_RULES];
 
 // ----------------- ACCIONES -----------------
-static void executeActions(const Rule &r, uint32_t now_ms) {
-  for (int i = 0; i < r.actuator_count; i++) {
-    if (r.actuator_idxs[i] >= MAX_SENSORS) continue;
-    auto &c = sensors::calibrations[r.actuator_idxs[i]];
-    switch (r.actions[i]) {
-      case ACT_ON:
-        if (!c.state) sensors::handleToggle(c.uid);
-        break;
-      case ACT_OFF:
-        if (c.state) sensors::handleToggle(c.uid);
-        break;
-      case ACT_TOGGLE:
-        sensors::handleToggle(c.uid);
-        break;
-      case ACT_LEVEL:
-        if (c.type == sensors::TYPE_DIMMER) sensors::handleDimmer(c.uid, r.levels[i]);
-        break;
-    }
+static bool executeAction(const Automation &a, uint8_t index) {
+  if (index >= a.actuator_count) return true;
+  uint8_t idx = a.a_sensor[index];
+  if (idx >= MAX_SENSORS) return false;
+  auto &c = sensors::calibrations[idx];
+  if (c.uid == 0) return false;
+  switch (a.a_action[index]) {
+    case ACT_ON:
+      if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) return false;
+      if (!c.state) sensors::handleToggle(c.uid);
+      return true;
+    case ACT_OFF:
+      if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) return false;
+      if (c.state) sensors::handleToggle(c.uid);
+      return true;
+    case ACT_TOGGLE:
+      if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) return false;
+      sensors::handleToggle(c.uid);
+      return true;
+    case ACT_LEVEL:
+      if (c.type != sensors::TYPE_DIMMER) return false;
+      sensors::handleDimmer(c.uid, a.a_level[index]);
+      return true;
+    default:
+      return false;
   }
 }
 
-static bool isDateInRange(const Rule &r) {
-  if (r.year_start == 0 && r.year_end == 0) {
-    return true;
+static void advanceSequence(Automation &a, AutomationState &s, uint32_t now_ms) {
+  if (!s.seq_active) return;
+  if (s.seq_at != 0 && now_ms < s.seq_at) return;
+  while (true) {
+    if (s.seq_index >= a.actuator_count) {
+      s.seq_active = false;
+      s.seq_index = 0;
+      s.seq_at = 0;
+      s.retry_at = 0;
+      return;
+    }
+    if (!executeAction(a, s.seq_index)) {
+      if (s.seq_retries_left > 0) {
+        s.seq_retries_left--;
+        s.retry_at = now_ms + (uint32_t)a.retry_interval_s * 1000UL;
+        s.seq_at = s.retry_at;
+        logger::warnf("Auto %d action %d failed, retries left %d",
+                     (int)(&a - rules), s.seq_index, s.seq_retries_left);
+        return;
+      }
+      logger::warnf("Auto %d action %d failed, giving up", (int)(&a - rules), s.seq_index);
+      s.seq_active = false;
+      s.seq_index = 0;
+      s.seq_at = 0;
+      s.retry_at = 0;
+      return;
+    }
+    s.seq_index++;
+    if (s.seq_index < a.actuator_count && a.step_ms > 0) {
+      s.seq_at = now_ms + a.step_ms;
+      s.retry_at = 0;
+      return;
+    }
+    s.retry_at = 0;
+    s.seq_at = 0;
   }
-  if (!sensors::timeValid()) {
-    return false;
-  }
-  sensors::RTCTime now = sensors::getTime();
-  int current_year = now.year;
-  int current_month = now.month;
-  int current_day = now.day;
-  bool after_start = (r.year_start == 0) || (current_year > r.year_start) || (current_year == r.year_start && current_month > r.month_start) || (current_year == r.year_start && current_month == r.month_start && current_day >= r.day_start);
-  bool before_end = (r.year_end == 0) || (current_year < r.year_end) || (current_year == r.year_end && current_month < r.month_end) || (current_year == r.year_end && current_month == r.month_end && current_day <= r.day_end);
-  return after_start && before_end;
 }
 
 // ----------------- TICK -----------------
@@ -77,116 +86,76 @@ void tick(uint32_t now_ms) {
   last_run = now_ms;
 
   for (int i = 0; i < MAX_RULES; i++) {
-    Rule &r = rules[i];
-    RuleState &s = states[i];
+    Automation &a = rules[i];
+    AutomationState &s = states[i];
 
-    if (r.sensor_count == 0 && r.actuator_count == 0) continue;
-    if (!isDateInRange(r)) continue;
+    if (a.sensor_count == 0 && a.actuator_count == 0) continue;
 
-    bool trigger = r.logical_and ? true : false;
+    bool fire = false;
+    bool isSample = isSampleKind(a);
 
-    // --- SENSORES (EDGE / THRESHOLD) ---
-    if (r.type == RULE_EDGE || r.type == RULE_THRESHOLD) {
-      for (int j = 0; j < r.sensor_count; j++) {
-        if (r.sensor_idxs[j] >= MAX_SENSORS) continue;
-        auto &sensor = sensors::calibrations[r.sensor_idxs[j]];
-
-        bool val_trigger = false;
-
-        if (r.type == RULE_EDGE) {
-          bool raw = sensor.state;
-
-          // Anti-bounce
-          if (raw == s.last[j]) {
-            if (s.counter[j] < CONFIRM_READS) s.counter[j]++;
-          } else {
-            s.last[j] = raw;
-            s.counter[j] = 1;
-          }
-          // No suficientes lecturas confirmadas:
-          // val_trigger se mantiene false (inicializado arriba).
-          // No hacer 'continue' — el trigger AND/OR necesita evaluar
-          // todos los sensores para no disparar prematuramente.
-          if (s.counter[j] >= CONFIRM_READS) {
-            bool rising = (!s.stable[j] && raw);
-            bool falling = (s.stable[j] && !raw);
-
-            switch (r.cmp[j]) {
-              case CMP_GT: val_trigger = rising; break;
-              case CMP_LT: val_trigger = falling; break;
-              default: val_trigger = false;
-            }
-            s.stable[j] = raw;
-          }
-        } else if (r.type == RULE_THRESHOLD) {
-          float val = sensor.value;
-          bool condition_met = false;
-
-          switch (r.cmp[j]) {
-            case CMP_GT:
-              condition_met = (val > r.threshold[j]);
-              break;
-            case CMP_LT:
-              condition_met = (val < r.threshold[j]);
-              break;
-            case CMP_EQ:
-              condition_met = (fabs(val - r.threshold[j]) < 0.5f);
-              break;
-            default:
-              condition_met = false;
-          }
-          val_trigger = condition_met;
-        }
-        if (r.logical_and) trigger &= val_trigger;
-        else trigger |= val_trigger;
-      }
-    }
-
-    // --- TIME ---
-    else if (r.type == RULE_TIME) {
-      if (!sensors::timeValid()) continue;
-      sensors::RTCTime now = sensors::getTime();
-      uint16_t timeOfDay = sensors::getMinutesOfDay();
-      uint16_t ruleTime = r.time_s / 60;
-      uint32_t currentDate = now.year * 10000UL + now.month * 100UL + now.day;
-
-      if (timeOfDay >= ruleTime && timeOfDay < ruleTime + 1) {
-        if (s.last_time_exec != currentDate) {
-          s.last_time_exec = currentDate;
-          trigger = true;
+    if (isSample) {
+      CondSample smp[MAX_CONDITIONS];
+      for (int j = 0; j < (int)a.sensor_count && j < MAX_CONDITIONS; j++) {
+        if (a.c_sensor[j] < MAX_SENSORS) {
+          smp[j].value = sensors::calibrations[a.c_sensor[j]].value;
+          smp[j].state = sensors::calibrations[a.c_sensor[j]].state;
+        } else {
+          smp[j].value = 0;
+          smp[j].state = false;
         }
       }
-    }
-
-    // --- INTERVAL ---
-    else if (r.type == RULE_INTERVAL) {
-      if (now_ms - s.last_interval_exec < r.interval_ms) continue;
-      s.last_interval_exec = now_ms;
-      trigger = true;
-    }
-
-    if (!trigger) continue;
-    if (now_ms - s.last_action < r.cooldown_ms) continue;
-
-    logger::eventf("Rule %d triggered (type:%d)", i, r.type);
-
-    // Ejecutar acciones
-    if (r.delay_ms == 0) {
-      executeActions(r, now_ms);
-      s.last_action = now_ms;
+      uint8_t mask = sampleConditions(a, s, smp, SAMPLE_MS);
+      bool tree = evalTree(a, mask);
+      if (a.for_ms > 0) fire = forWindowTick(a, s, tree, now_ms);
+      else fire = entryTick(a, s, tree);
     } else {
-      if (!s.pending) {
-        s.pending = true;
-        s.trigger_time = now_ms;
+      int y = 0, m = 0, d = 0;
+      uint32_t minOfDay = 0, dateCode = 0;
+      bool timeOk = sensors::timeValid();
+      if (timeOk) {
+        sensors::RTCTime t = sensors::getTime();
+        y = t.year; m = t.month; d = t.day;
+        minOfDay = sensors::getMinutesOfDay();
+        dateCode = (uint32_t)t.year * 10000UL + (uint32_t)t.month * 100UL + (uint32_t)t.day;
+      }
+      if (!dateInWindow(a, y, m, d)) continue;
+      if (a.kind == ON_TIME) {
+        fire = timeGateTick(a, s, minOfDay, dateCode, timeOk);
+      } else {
+        fire = intervalGateTick(a, s, now_ms);
       }
     }
 
-    // Ejecutar acciones pendientes
-    if (s.pending && now_ms - s.trigger_time >= r.delay_ms) {
-      executeActions(r, now_ms);
-      s.pending = false;
-      s.last_action = now_ms;
+    bool launch = false;
+    if (s.delayed) {
+      if (now_ms - s.delay_start >= a.fire_delay_ms) {
+        s.delayed = false;
+        s.delay_start = 0;
+        launch = true;
+      }
+    } else if (fire) {
+      if (now_ms - s.last_action >= a.cooldown_ms) {
+        if (a.fire_delay_ms > 0) {
+          s.delayed = true;
+          s.delay_start = now_ms;
+        } else {
+          launch = true;
+        }
+      }
     }
+
+    if (launch && !s.seq_active) {
+      s.seq_active = true;
+      s.seq_index = 0;
+      s.seq_retries_left = a.retry_max;
+      s.seq_at = 0;
+      s.retry_at = 0;
+      s.last_action = now_ms;
+      logger::eventf("Rule %d fired (kind:%d)", i, a.kind);
+    }
+
+    advanceSequence(a, s, now_ms);
   }
 }
 
@@ -200,21 +169,21 @@ void saveRulesToEEPROM() {
 
 void deleteRule(uint8_t idx) {
   if (idx >= MAX_RULES) return;
-  memset(&rules[idx], 0, sizeof(Rule));
-  memset(&states[idx], 0, sizeof(RuleState));
+  memset(&rules[idx], 0, sizeof(Automation));
+  memset(&states[idx], 0, sizeof(AutomationState));
   saveRulesToEEPROM();
 }
 
 bool isIndexReferenced(uint8_t idx) {
   if (idx >= MAX_SENSORS) return false;
   for (int i = 0; i < MAX_RULES; i++) {
-    const Rule &r = rules[i];
-    if (r.sensor_count == 0 && r.actuator_count == 0) continue;
-    for (int j = 0; j < r.sensor_count; j++) {
-      if (r.sensor_idxs[j] == idx) return true;
+    const Automation &a = rules[i];
+    if (a.sensor_count == 0 && a.actuator_count == 0) continue;
+    for (int j = 0; j < (int)a.sensor_count && j < MAX_CONDITIONS; j++) {
+      if (a.c_sensor[j] == idx) return true;
     }
-    for (int j = 0; j < r.actuator_count; j++) {
-      if (r.actuator_idxs[j] == idx) return true;
+    for (int j = 0; j < (int)a.actuator_count && j < MAX_ACTIONS; j++) {
+      if (a.a_sensor[j] == idx) return true;
     }
   }
   return false;
@@ -224,7 +193,7 @@ bool isIndexReferenced(uint8_t idx) {
 void init() {
   loadRulesFromEEPROM();
   for (int i = 0; i < MAX_RULES; i++) {
-    memset(&states[i], 0, sizeof(RuleState));
+    memset(&states[i], 0, sizeof(AutomationState));
   }
 }
 

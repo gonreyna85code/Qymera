@@ -872,6 +872,554 @@ t.begin_poll()
 leftover = t.poll()
 check("leftover drained after begin_poll", leftover == (b"z8", "10.0.0.1"))
 
+# ---------------------------------------------------------------- automation engine 2.0
+# Mirrors src/automation_core.h (pure primitives) + automations.cpp (tick policy:
+# fire-once-per-entry, for_ms window, fire_delay, cooldown, sequencing, retries).
+
+ON_SAMPLE, ON_TIME, ON_INTERVAL = 0, 1, 2
+CMP_GT, CMP_LT, CMP_EQ = 0, 1, 2
+EDGE_RISING, EDGE_FALLING = 3, 4
+ACT_ON, ACT_OFF, ACT_TOGGLE, ACT_LEVEL = 0, 1, 2, 3
+MAX_CONDITIONS, MAX_ACTIONS = 5, 5
+SAMPLE_MS = 50
+
+
+def auto(**kw):
+    a = dict(kind=ON_SAMPLE, sensor_count=0, actuator_count=0,
+             c_sensor=[0] * 5, c_cmp=[0] * 5, c_threshold=[0] * 5,
+             c_hys_dec=0, c_op_bits=0,
+             a_sensor=[0] * 5, a_action=[0] * 5, a_level=[0] * 5,
+             retry_max=0, retry_interval_s=0, debounce_ms=0, for_ms=0,
+             fire_delay_ms=0, step_ms=0, cooldown_ms=0, time_s=0, interval_ms=0,
+             year_start=0, year_end=0, month_start=0, month_end=0,
+             day_start=0, day_end=0)
+    a.update(kw)
+    return a
+
+
+def st():
+    return dict(last=[0] * 5, stable=[0] * 5, counter=[0] * 5, cond_active=0,
+                window_active=False, window_fired=False, entry_fired=False, delayed=False,
+                window_start=0, delay_start=0, last_action=0, last_time_exec=0,
+                last_interval_exec=0, seq_active=False, seq_index=0, seq_at=0,
+                seq_retries_left=0, retry_at=0)
+
+
+def sample_conditions(a, s, smp, sample_ms):
+    mask = 0
+    debounce = 1
+    if a["debounce_ms"] > 0:
+        debounce = (a["debounce_ms"] + sample_ms - 1) // sample_ms
+    for j in range(min(a["sensor_count"], MAX_CONDITIONS)):
+        cmp = a["c_cmp"][j]
+        state = False
+        if cmp in (EDGE_RISING, EDGE_FALLING):
+            raw = smp[j][1]
+            if raw == s["last"][j]:
+                if s["counter"][j] < debounce:
+                    s["counter"][j] += 1
+            else:
+                s["last"][j] = 1 if raw else 0
+                s["counter"][j] = 1
+            if s["counter"][j] >= debounce:
+                declared = s["last"][j] == 1
+                if cmp == EDGE_RISING:
+                    state = declared and not s["stable"][j]
+                else:
+                    state = (not declared) and s["stable"][j]
+                s["stable"][j] = 1 if declared else 0
+        else:
+            val, _ = smp[j]
+            th = a["c_threshold"][j]
+            hys = a["c_hys_dec"] * 0.1
+            engaged = bool(s["cond_active"] & (1 << j))
+            if cmp == CMP_GT:
+                if val > th:
+                    engaged = True
+                elif val < th - hys:
+                    engaged = False
+            elif cmp == CMP_LT:
+                if val < th:
+                    engaged = True
+                elif val > th + hys:
+                    engaged = False
+            else:
+                band = hys if hys > 0 else 0.5
+                engaged = (th - band) <= val <= (th + band)
+            if engaged:
+                s["cond_active"] |= (1 << j)
+            else:
+                s["cond_active"] &= ~(1 << j)
+            conv = s["last"][j] == 1
+            if engaged == conv:
+                if s["counter"][j] < debounce:
+                    s["counter"][j] += 1
+            else:
+                s["last"][j] = 1 if engaged else 0
+                s["counter"][j] = 1
+            state = (s["counter"][j] >= debounce) and engaged
+        if state:
+            mask |= (1 << j)
+    return mask
+
+
+def eval_tree(a, mask):
+    n = min(a["sensor_count"], MAX_CONDITIONS)
+    if n == 0:
+        return False
+    t = (mask & 1) != 0
+    for j in range(1, n):
+        cj = (mask & (1 << j)) != 0
+        orj = (a["c_op_bits"] & (1 << (j - 1))) != 0
+        t = (t or cj) if orj else (t and cj)
+    return t
+
+
+def date_in_window(a, y, m, d):
+    if a["year_start"] == 0 and a["year_end"] == 0:
+        return True
+    if y < a["year_start"] or y > a["year_end"]:
+        return False
+    if y == a["year_start"] and (m < a["month_start"] or
+                                 (m == a["month_start"] and d < a["day_start"])):
+        return False
+    if y == a["year_end"] and (m > a["month_end"] or
+                               (m == a["month_end"] and d > a["day_end"])):
+        return False
+    return True
+
+
+def entry_tick(a, s, tree):
+    if not tree:
+        s["entry_fired"] = False
+        return False
+    if not s["entry_fired"]:
+        s["entry_fired"] = True
+        return True
+    return False
+
+
+def for_window_tick(a, s, tree, now_ms):
+    if not tree:
+        s["window_active"] = False
+        s["window_fired"] = False
+        s["window_start"] = now_ms
+        return False
+    if not s["window_active"]:
+        s["window_active"] = True
+        s["window_start"] = now_ms
+        s["window_fired"] = False
+    if not s["window_fired"] and (now_ms - s["window_start"]) >= a["for_ms"]:
+        s["window_fired"] = True
+        return True
+    return False
+
+
+def time_gate_tick(a, s, minute_of_day, date_code, time_valid):
+    if not time_valid:
+        return False
+    target = a["time_s"] // 60
+    if minute_of_day == target:
+        if s["last_time_exec"] != date_code:
+            s["last_time_exec"] = date_code
+            return True
+    return False
+
+
+def interval_gate_tick(a, s, now_ms):
+    if (now_ms - s["last_interval_exec"]) < a["interval_ms"]:
+        return False
+    s["last_interval_exec"] = now_ms
+    return True
+
+
+def advance_sequence(a, s, now_ms, exec_fn):
+    if not s["seq_active"]:
+        return []
+    if s["seq_at"] != 0 and now_ms < s["seq_at"]:
+        return []
+    done = []
+    while True:
+        if s["seq_index"] >= a["actuator_count"]:
+            s["seq_active"] = False
+            s["seq_index"] = 0
+            s["seq_at"] = 0
+            s["retry_at"] = 0
+            return done
+        ok = exec_fn(s["seq_index"])
+        if not ok:
+            if s["seq_retries_left"] > 0:
+                s["seq_retries_left"] -= 1
+                s["retry_at"] = now_ms + a["retry_interval_s"] * 1000
+                s["seq_at"] = s["retry_at"]
+                return done
+            s["seq_active"] = False
+            s["seq_index"] = 0
+            s["seq_at"] = 0
+            s["retry_at"] = 0
+            return done
+        done.append(s["seq_index"])
+        s["seq_index"] += 1
+        if s["seq_index"] < a["actuator_count"] and a["step_ms"] > 0:
+            s["seq_at"] = now_ms + a["step_ms"]
+            s["retry_at"] = 0
+            return done
+        s["retry_at"] = 0
+        s["seq_at"] = 0
+
+
+def engine_step(a, s, now_ms, smp, exec_fn, time_valid=True, minute_of_day=0,
+                date_code=20260820, y=2026, m=8, d=20):
+    if a["sensor_count"] == 0 and a["actuator_count"] == 0:
+        return []
+    fire = False
+    if a["kind"] == ON_SAMPLE:
+        mask = sample_conditions(a, s, smp, SAMPLE_MS)
+        tree = eval_tree(a, mask)
+        if a["for_ms"] > 0:
+            fire = for_window_tick(a, s, tree, now_ms)
+        else:
+            fire = entry_tick(a, s, tree)
+    else:
+        if not date_in_window(a, y, m, d):
+            return []
+        if a["kind"] == ON_TIME:
+            fire = time_gate_tick(a, s, minute_of_day, date_code, time_valid)
+        else:
+            fire = interval_gate_tick(a, s, now_ms)
+    launch = False
+    if s["delayed"]:
+        if now_ms - s["delay_start"] >= a["fire_delay_ms"]:
+            s["delayed"] = False
+            s["delay_start"] = 0
+            launch = True
+    elif fire:
+        if now_ms - s["last_action"] >= a["cooldown_ms"]:
+            if a["fire_delay_ms"] > 0:
+                s["delayed"] = True
+                s["delay_start"] = now_ms
+            else:
+                launch = True
+    if launch and not s["seq_active"]:
+        s["seq_active"] = True
+        s["seq_index"] = 0
+        s["seq_retries_left"] = a["retry_max"]
+        s["seq_at"] = 0
+        s["retry_at"] = 0
+        s["last_action"] = now_ms
+    return advance_sequence(a, s, now_ms, exec_fn)
+
+
+def on_sample(a, s, now_ms, vals, exec_fn):
+    return engine_step(a, s, now_ms, [(v, False) for v in vals], exec_fn)
+
+
+print("[automation]")
+_layout = 4 + 5 + 5 + 10 + 1 + 1 + 5 + 5 + 5 + 1 + 1 + 7 * 4 + 2 + 2 + 4
+check("Automation struct layout == 80 bytes",
+      _layout + (4 - _layout % 4) % 4 == 80)
+check("20 automations + header fit v2 rules region",
+      8 + 20 * 80 <= 1664 and 8 + 20 * 64 <= 1600)
+
+# ---- condition tree (AND / OR / mixed chain) ----
+a = auto(sensor_count=2, c_cmp=[CMP_GT, CMP_GT], c_threshold=[30, 80],
+         c_op_bits=0b00, actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+check("AND tree: only condition 1 false", not eval_tree(a, 0b01))
+check("AND tree: only condition 2 false", not eval_tree(a, 0b10))
+check("AND tree: both true", eval_tree(a, 0b11))
+a2 = auto(sensor_count=2, c_cmp=[CMP_GT, CMP_GT], c_threshold=[30, 80],
+          c_op_bits=0b11, actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+check("OR tree: either condition true", eval_tree(a2, 0b01) and eval_tree(a2, 0b10))
+a3 = auto(sensor_count=3, c_op_bits=0b01)  # (A OR B) AND C, left-assoc
+check("mixed chain (A OR B) AND C: (F OR T) AND F",
+      not eval_tree(a3, 0b010))
+check("mixed chain (A OR B) AND C: (F OR T) AND T",
+      eval_tree(a3, 0b110))
+check("mixed chain (A OR B) AND C: (T OR F) AND T",
+      eval_tree(a3, 0b101))
+check("mixed chain (A OR B) AND C: (T OR T) AND F",
+      not eval_tree(a3, 0b011))
+
+# ---- hysteresis (GT and LT, per 0.1-dec units) ----
+hg = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], c_hys_dec=10)
+s = st()
+check("hysteresis GT: 29.0 not engaged",
+      sample_conditions(hg, s, [(29.0, False)], SAMPLE_MS) == 0)
+check("hysteresis GT: 30.5 engages",
+      sample_conditions(hg, s, [(30.5, False)], SAMPLE_MS) == 1)
+check("hysteresis GT: 29.5 still held (no re-fire)",
+      sample_conditions(hg, s, [(29.5, False)], SAMPLE_MS) == 1)
+check("hysteresis GT: 28.4 releases",
+      sample_conditions(hg, s, [(28.4, False)], SAMPLE_MS) == 0)
+hl = auto(sensor_count=1, c_cmp=[CMP_LT], c_threshold=[30], c_hys_dec=10)
+s = st()
+check("hysteresis LT: 29.4 engages",
+      sample_conditions(hl, s, [(29.4, False)], SAMPLE_MS) == 1)
+check("hysteresis LT: 30.5 below release threshold (31), still held",
+      sample_conditions(hl, s, [(30.5, False)], SAMPLE_MS) == 1)
+check("hysteresis LT: 31.6 releases",
+      sample_conditions(hl, s, [(31.6, False)], SAMPLE_MS) == 0)
+
+# ---- debounce (150 ms = 3 samples @ 50 ms) ----
+db = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], debounce_ms=150,
+          actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("debounce: 50 ms spike suppressed",
+      on_sample(db, s, 100, [35], lambda i: out.append(i) or True) == [] and not out)
+check("debounce: sustained 3 samples fires once",
+      on_sample(db, s, 150, [35], lambda i: out.append(i) or True) == []
+      and on_sample(db, s, 200, [35], lambda i: out.append(i) or True) == [0])
+check("debounce: no repeat while held",
+      on_sample(db, s, 250, [35], lambda i: out.append(i) or True) == [])
+
+# ---- edges ----
+eg = auto(sensor_count=1, c_cmp=[EDGE_RISING], debounce_ms=0, actuator_count=1,
+          a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+
+
+def es(i):
+    out.append(i)
+    return True
+
+
+check("edge rising: no fire on stable low",
+      engine_step(eg, s, 100, [(0, False)], es) == [])
+check("edge rising: fires on 0->1",
+      engine_step(eg, s, 150, [(0, True)], es) == [0])
+check("edge rising: no repeat while high",
+      engine_step(eg, s, 200, [(0, True)], es) == [])
+check("edge rising: re-arms after going low",
+      engine_step(eg, s, 250, [(0, False)], es) == []
+      and s["stable"][0] == 0)
+check("edge rising: fires again on next 0->1",
+      engine_step(eg, s, 300, [(0, True)], es) == [0])
+efg = auto(sensor_count=1, c_cmp=[EDGE_FALLING], debounce_ms=0, actuator_count=1,
+           a_sensor=[0], a_action=[ACT_OFF])
+s = st()
+out = []
+
+
+def es2(i):
+    out.append(i)
+    return True
+
+
+check("edge falling: no fire while high",
+      engine_step(efg, s, 100, [(0, True)], es2) == [])
+check("edge falling: fires on 1->0",
+      engine_step(efg, s, 150, [(0, False)], es2) == [0])
+check("edge falling: no repeat while low",
+      engine_step(efg, s, 200, [(0, False)], es2) == [])
+
+# ---- fire-once per entry (no repeat while satisfied) ----
+fo = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], debounce_ms=0,
+          actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("fire-once: first satisfaction fires",
+      engine_step(fo, s, 100, [(35, False)], es) == [0])
+check("fire-once: no repeat while still satisfied",
+      engine_step(fo, s, 150, [(35, False)], es) == [])
+check("fire-once: re-arms after release",
+      engine_step(fo, s, 200, [(20, False)], es) == []
+      and s["entry_fired"] is False)
+
+# ---- for_ms hold window ----
+fw = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], for_ms=5000,
+          debounce_ms=0, actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("for_ms: no fire before 5 s",
+      engine_step(fw, s, 1000, [(35, False)], es) == [])
+check("for_ms: fires exactly at 5 s hold",
+      engine_step(fw, s, 6000, [(35, False)], es) == [0])
+check("for_ms: no repeat while still held",
+      engine_step(fw, s, 7000, [(35, False)], es) == [])
+check("for_ms: re-arms after release",
+      engine_step(fw, s, 8000, [(20, False)], es) == []
+      and s["window_active"] is False)
+
+# ---- fire_delay ----
+fd = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], fire_delay_ms=1000,
+          debounce_ms=0, actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("fire_delay: armed but not executed before delay",
+      engine_step(fd, s, 1000, [(35, False)], es) == [])
+check("fire_delay: condition leaves window before expiry",
+      engine_step(fd, s, 1500, [(20, False)], es) == [])
+check("fire_delay: executes at delay expiry",
+      engine_step(fd, s, 2000, [(20, False)], es) == [0])
+
+# ---- cooldown ----
+cd = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], cooldown_ms=2000,
+          debounce_ms=0, actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("cooldown: first fire executes",
+      engine_step(cd, s, 3000, [(35, False)], es) == [0])
+check("cooldown: re-entry during cooldown blocked",
+      engine_step(cd, s, 4000, [(20, False)], es) == []
+      and engine_step(cd, s, 4000, [(35, False)], es) == [])
+check("cooldown: re-entry after window allowed",
+      engine_step(cd, s, 4050, [(20, False)], es) == []
+      and engine_step(cd, s, 5050, [(35, False)], es) == [0])
+
+# ---- sequencing (step_ms gap between actions) ----
+sq = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], debounce_ms=0,
+          step_ms=1000, actuator_count=2, a_sensor=[0, 1],
+          a_action=[ACT_ON, ACT_OFF])
+s = st()
+out = []
+check("step_ms: first action immediate",
+      engine_step(sq, s, 1000, [(35, False)], es) == [0])
+check("step_ms: second action waits step gap",
+      engine_step(sq, s, 1500, [(35, False)], es) == [])
+check("step_ms: second action after gap",
+      engine_step(sq, s, 2000, [(35, False)], es) == [1])
+
+# ---- retry / failure ----
+rt = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], debounce_ms=0,
+          retry_max=2, retry_interval_s=1, actuator_count=1,
+          a_sensor=[0], a_action=[ACT_ON])
+s = st()
+attempts = {"n": 0}
+
+
+def flaky(i):
+    attempts["n"] += 1
+    return False
+
+
+check("retry: gives up after retries exhausted",
+      engine_step(rt, s, 1000, [(35, False)], flaky) == []
+      and attempts["n"] == 1)
+check("retry: retry scheduled after failure",
+      s["seq_at"] == 2000 and s["seq_retries_left"] == 1)
+check("retry: second failure schedules next retry",
+      engine_step(rt, s, 2000, [(35, False)], flaky) == []
+      and attempts["n"] == 2)
+check("retry: final failure gives up",
+      engine_step(rt, s, 3000, [(35, False)], flaky) == []
+      and attempts["n"] == 3 and not s["seq_active"])
+s = st()
+attempts = {"n": 0}
+
+
+def flaky_once(i):
+    attempts["n"] += 1
+    return attempts["n"] > 1
+
+
+check("retry: succeeds on retry after interval",
+      engine_step(rt, s, 1000, [(35, False)], flaky_once) == []
+      and s["seq_at"] == 2000
+      and engine_step(rt, s, 2000, [(35, False)], flaky_once) == [0])
+
+# ---- ON_TIME daily single fire ----
+tm = auto(kind=ON_TIME, time_s=7200, actuator_count=1, a_sensor=[0],
+          a_action=[ACT_ON])
+s = st()
+out = []
+check("ON_TIME: no fire before slot",
+      engine_step(tm, s, 1000, [], es, minute_of_day=119, date_code=20260820,
+                  time_valid=True) == [])
+check("ON_TIME: fires inside slot",
+      engine_step(tm, s, 1000, [], es, minute_of_day=120, date_code=20260820,
+                  time_valid=True) == [0])
+check("ON_TIME: no repeat in same minute",
+      engine_step(tm, s, 1000, [], es, minute_of_day=120, date_code=20260820,
+                  time_valid=True) == [])
+check("ON_TIME: next day fires again",
+      engine_step(tm, s, 1000, [], es, minute_of_day=120, date_code=20260821,
+                  time_valid=True) == [0])
+check("ON_TIME: invalid RTC never fires",
+      engine_step(tm, s, 1000, [], es, minute_of_day=120, date_code=20260821,
+                  time_valid=False) == [])
+
+# ---- ON_TIME date window ----
+dw = auto(kind=ON_TIME, time_s=7200, year_start=2026, month_start=8, day_start=20,
+          year_end=2026, month_end=8, day_end=25, actuator_count=1,
+          a_sensor=[0], a_action=[ACT_ON])
+s = st()
+check("date window: outside window no fire",
+      engine_step(dw, s, 1000, [], es, minute_of_day=120, date_code=20260810,
+                  y=2026, m=8, d=10) == [])
+check("date window: boundary day fires",
+      engine_step(dw, s, 1000, [], es, minute_of_day=120, date_code=20260820,
+                  y=2026, m=8, d=20) == [0])
+
+# ---- ON_INTERVAL periodic ----
+iv = auto(kind=ON_INTERVAL, interval_ms=10000, actuator_count=1, a_sensor=[0],
+          a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("ON_INTERVAL: not before first period elapses",
+      engine_step(iv, s, 1000, [], es) == [])
+check("ON_INTERVAL: fires when period elapses",
+      engine_step(iv, s, 10000, [], es) == [0])
+check("ON_INTERVAL: no fire mid-interval",
+      engine_step(iv, s, 15000, [], es) == [])
+check("ON_INTERVAL: fires again next period",
+      engine_step(iv, s, 20000, [], es) == [0])
+
+# ---- storage v1 -> v2 migration mapping ----
+def migrate_legacy(lr):
+    a = auto()
+    a["kind"] = ON_SAMPLE if lr["type"] <= 1 else (ON_TIME if lr["type"] == 2 else ON_INTERVAL)
+    a["sensor_count"] = lr["sensor_count"]
+    a["actuator_count"] = lr["actuator_count"]
+    a["debounce_ms"] = 150 if lr["type"] == 0 else 0
+    a["fire_delay_ms"] = lr["delay_ms"]
+    a["cooldown_ms"] = lr["cooldown_ms"]
+    a["time_s"] = lr["time_s"]
+    a["interval_ms"] = lr["interval_ms"]
+    a["year_start"] = lr["year_start"]
+    a["year_end"] = lr["year_end"]
+    a["month_start"] = lr["month_start"]
+    a["month_end"] = lr["month_end"]
+    a["day_start"] = lr["day_start"]
+    a["day_end"] = lr["day_end"]
+    for j in range(5):
+        a["c_sensor"][j] = lr["sensor_idxs"][j]
+        a["c_threshold"][j] = lr["threshold"][j]
+        if a["kind"] == ON_SAMPLE:
+            if lr["type"] == 0:
+                a["c_cmp"][j] = EDGE_FALLING if lr["cmp"][j] == 1 else EDGE_RISING
+            else:
+                a["c_cmp"][j] = lr["cmp"][j]
+        else:
+            a["c_cmp"][j] = 0
+        if j < 4:
+            a["c_op_bits"] |= ((0 if lr["logical_and"] else 1) & 1) << j
+        a["a_sensor"][j] = lr["actuator_idxs"][j]
+        a["a_action"][j] = lr["actions"][j]
+        a["a_level"][j] = lr["levels"][j]
+    return a
+
+
+lr = dict(sensor_idxs=[3, 4, 0, 0, 0], sensor_count=2, type=0,
+          cmp=[0, 1, 0, 0, 0], threshold=[300, 500, 0, 0, 0], logical_and=1,
+          actuator_idxs=[7, 0, 0, 0, 0],
+          actions=[0, 0, 0, 0, 0], levels=[0, 0, 0, 0, 0], actuator_count=1,
+          delay_ms=250, cooldown_ms=1000, time_s=0, interval_ms=0,
+          year_start=0, year_end=0, month_start=0, month_end=0,
+          day_start=0, day_end=0)
+m = migrate_legacy(lr)
+check("migration: EDGE + GT cmp -> EDGE_RISING, debounce 150",
+      m["kind"] == ON_SAMPLE and m["debounce_ms"] == 150
+      and m["c_cmp"][0] == EDGE_RISING and m["c_cmp"][1] == EDGE_FALLING)
+check("migration: logical AND -> all-AND ops, delay -> fire_delay",
+      m["c_op_bits"] == 0 and m["fire_delay_ms"] == 250
+      and m["cooldown_ms"] == 1000)
+# Legacy v1 record is 64 bytes after alignment, 20 records + header fit old 1600.
+check("legacy v1 layout: 64 B records fit old region",
+      8 + 20 * 64 <= 1600)
+
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)

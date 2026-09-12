@@ -107,7 +107,7 @@ typedef WebServer WebServerCompat;
 
 /* Automation rules */
 #define EEPROM_RULES_START (EEPROM_CALIB_START + EEPROM_CALIB_SIZE)
-#define EEPROM_RULES_SIZE 1600
+#define EEPROM_RULES_SIZE 1664
 
 /* =========================
    PROTECCION EEPROM

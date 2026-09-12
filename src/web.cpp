@@ -408,49 +408,66 @@ ICACHE_FLASH_ATTR void handleRules() {
   json += '[';
   bool first = true;
   for (int i = 0; i < MAX_RULES; i++) {
-    const automations::Rule &r = automations::rules[i];
+    const automations::Automation &r = automations::rules[i];
     if (r.sensor_count == 0 && r.actuator_count == 0)
       continue;
     if (!first) json += ',';
     first = false;
+    int jsonType;
+    if (r.kind == automations::ON_TIME) jsonType = automations::RULE_TIME;
+    else if (r.kind == automations::ON_INTERVAL) jsonType = automations::RULE_INTERVAL;
+    else {
+      bool anyEdge = false;
+      for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
+        if (r.c_cmp[s] >= automations::EDGE_RISING) anyEdge = true;
+      }
+      jsonType = anyEdge ? automations::RULE_EDGE : automations::RULE_THRESHOLD;
+    }
+    bool logicAnd = true;
+    for (int j = 0; j + 1 < (int)r.sensor_count && j < (int)automations::MAX_CONDITIONS - 1; j++) {
+      if ((r.c_op_bits & (1 << j)) != 0) logicAnd = false;
+    }
     json += "{\"id\":";
     json += i;
     json += ",\"sensors\":[";
-    for (int s = 0; s < r.sensor_count; s++) {
+    for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
       if (s) json += ',';
-      json += r.sensor_idxs[s];
+      json += r.c_sensor[s];
     }
     json += "],\"type\":";
-    json += r.type;
+    json += jsonType;
     json += ",\"logical_and\":";
-    json += r.logical_and;
+    json += logicAnd;
     json += ",\"cmp\":[";
-    for (int s = 0; s < r.sensor_count; s++) {
+    for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
       if (s) json += ',';
-      json += r.cmp[s];
+      int c = r.c_cmp[s];
+      if (c == automations::EDGE_RISING) c = 0;
+      else if (c == automations::EDGE_FALLING) c = 1;
+      json += c;
     }
     json += "],\"threshold\":[";
-    for (int s = 0; s < r.sensor_count; s++) {
+    for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
       if (s) json += ',';
-      json += r.threshold[s];
+      json += r.c_threshold[s];
     }
     json += "],\"actuators\":[";
-    for (int a = 0; a < r.actuator_count; a++) {
+    for (int a = 0; a < (int)r.actuator_count && a < (int)automations::MAX_ACTIONS; a++) {
       if (a) json += ',';
-      json += r.actuator_idxs[a];
+      json += r.a_sensor[a];
     }
     json += "],\"actions\":[";
-    for (int a = 0; a < r.actuator_count; a++) {
+    for (int a = 0; a < (int)r.actuator_count && a < (int)automations::MAX_ACTIONS; a++) {
       if (a) json += ',';
-      json += r.actions[a];
+      json += r.a_action[a];
     }
     json += "],\"levels\":[";
-    for (int a = 0; a < r.actuator_count; a++) {
+    for (int a = 0; a < (int)r.actuator_count && a < (int)automations::MAX_ACTIONS; a++) {
       if (a) json += ',';
-      json += r.levels[a];
+      json += r.a_level[a];
     }
     json += "],\"delay_ms\":";
-    json += r.delay_ms;
+    json += r.fire_delay_ms;
     json += ",\"cooldown_ms\":";
     json += r.cooldown_ms;
     json += ",\"time_s\":";
@@ -469,6 +486,23 @@ ICACHE_FLASH_ATTR void handleRules() {
     json += r.day_start;
     json += ",\"day_end\":";
     json += r.day_end;
+    json += ",\"debounce_ms\":";
+    json += r.debounce_ms;
+    json += ",\"for_ms\":";
+    json += r.for_ms;
+    json += ",\"step_ms\":";
+    json += r.step_ms;
+    json += ",\"hys\":";
+    json += r.c_hys_dec;
+    json += ",\"ops\":[";
+    for (int j = 0; j + 1 < (int)r.sensor_count && j < (int)automations::MAX_CONDITIONS - 1; j++) {
+      if (j) json += ',';
+      json += ((r.c_op_bits & (1 << j)) != 0) ? 1 : 0;
+    }
+    json += "],\"retry\":";
+    json += r.retry_max;
+    json += ",\"retry_interval\":";
+    json += r.retry_interval_s;
     json += '}';
   }
   json += ']';
@@ -505,11 +539,37 @@ void handleSetRule() {
     server.send(400, "text/plain", "invalid id");
     return;
   }
-  Rule &r = rules[id];
-  memset(&r, 0, sizeof(Rule));
+  Automation &r = rules[id];
+  memset(&r, 0, sizeof(Automation));
+  memset(&states[id], 0, sizeof(AutomationState));
   // ================= LOGICAL OPERATOR =================
-  // UI sends 'logic' (1 = AND, 0 = OR). Defaults to OR when absent.
-  r.logical_and = server.hasArg("logic") && server.arg("logic") == "1";
+  // UI sends 'logic' (1 = AND, 0 = OR). Defaults to OR when absent. Optional
+  // 'ops' overrides the join between each pair of conditions (0=AND, 1=OR).
+  uint8_t ops_bits = 0;
+  bool hasOps = server.hasArg("ops") && server.arg("ops").length() > 0;
+  if (hasOps) {
+    String ops_str = server.arg("ops");
+    int oi = 0;
+    while (ops_str.length() && oi < 4) {
+      int comma = ops_str.indexOf(',');
+      String token = (comma == -1) ? ops_str : ops_str.substring(0, comma);
+      long op_long = 0;
+      if (!parseStrictUnsigned(token, (unsigned long&)op_long) || (op_long != 0 && op_long != 1)) {
+        server.send(400, "text/plain", "invalid ops");
+        return;
+      }
+      if (op_long == 1) ops_bits |= (1 << oi);
+      oi++;
+      if (comma == -1) break;
+      ops_str = ops_str.substring(comma + 1);
+    }
+  } else {
+    bool useAnd = server.hasArg("logic") && server.arg("logic") == "1";
+    for (int j = 0; j < 4; j++) {
+      if (!useAnd) ops_bits |= (1 << j);
+    }
+  }
+  r.c_op_bits = ops_bits;
   // ================= TYPE =================
   if (!server.hasArg("type")) {
     server.send(400, "text/plain", "type required");
@@ -520,7 +580,11 @@ void handleSetRule() {
     server.send(400, "text/plain", "invalid type");
     return;
   }
-  r.type = (RuleType)ruleType;
+  if (ruleType == RULE_TIME) r.kind = ON_TIME;
+  else if (ruleType == RULE_INTERVAL) r.kind = ON_INTERVAL;
+  else r.kind = ON_SAMPLE;
+  // Default debounce for legacy EDGE rules: 3 confirm reads x 50 ms
+  if (ruleType == RULE_EDGE) r.debounce_ms = 150;
   // ================= SENSORS =================
   if (server.hasArg("sensors")) {
     String sensors_str = server.arg("sensors");
@@ -540,7 +604,7 @@ void handleSetRule() {
         server.send(400, "text/plain", "sensor not configured");
         return;
       }
-      r.sensor_idxs[idx] = sensor_id;
+      r.c_sensor[idx] = sensor_id;
       // CMP
       int cmp_val = 0;
       if (cmp_str.length()) {
@@ -559,7 +623,11 @@ void handleSetRule() {
         if (c != -1) cmp_str = cmp_str.substring(c + 1);
         else cmp_str = "";
       }
-      r.cmp[idx] = (Comparator)cmp_val;
+      if (ruleType == RULE_EDGE) {
+        r.c_cmp[idx] = (cmp_val == CMP_LT) ? EDGE_FALLING : EDGE_RISING;
+      } else {
+        r.c_cmp[idx] = cmp_val;
+      }
       // THRESHOLD
       int th = 0;
       if (threshold_str.length()) {
@@ -578,7 +646,7 @@ void handleSetRule() {
         if (c != -1) threshold_str = threshold_str.substring(c + 1);
         else threshold_str = "";
       }
-      r.threshold[idx] = th;
+      r.c_threshold[idx] = th;
       idx++;
       if (comma == -1) break;
       sensors_str = sensors_str.substring(comma + 1);
@@ -609,7 +677,7 @@ void handleSetRule() {
         server.send(400, "text/plain", "invalid actuator type");
         return;
       }
-      r.actuator_idxs[idx] = actuator_id;
+      r.a_sensor[idx] = actuator_id;
       int action = 2;
       if (actions_str.length()) {
         int c = actions_str.indexOf(',');
@@ -631,7 +699,7 @@ void handleSetRule() {
         if (c != -1) actions_str = actions_str.substring(c + 1);
         else actions_str = "";
       }
-      r.actions[idx] = (ActionType)action;
+      r.a_action[idx] = action;
       int level = 0;
       if (levels_str.length()) {
         int c = levels_str.indexOf(',');
@@ -649,7 +717,7 @@ void handleSetRule() {
         if (c != -1) levels_str = levels_str.substring(c + 1);
         else levels_str = "";
       }
-      r.levels[idx] = level;
+      r.a_level[idx] = level;
       idx++;
       if (comma == -1) break;
       actuators_str = actuators_str.substring(comma + 1);
@@ -661,12 +729,12 @@ void handleSetRule() {
     server.send(400, "text/plain", "at least one actuator required");
     return;
   }
-  if ((r.type == RULE_EDGE || r.type == RULE_THRESHOLD) && r.sensor_count == 0) {
+  if ((r.kind == ON_SAMPLE) && r.sensor_count == 0) {
     server.send(400, "text/plain", "sensors required");
     return;
   }
   // ================= TIME =================
-  if (r.type == RULE_TIME) {
+  if (r.kind == ON_TIME) {
     long time_s_long = 0;
     if (!parseStrictLong(server.arg("time_s"), time_s_long)) {
       server.send(400, "text/plain", "invalid time_s");
@@ -729,7 +797,7 @@ void handleSetRule() {
   }
 
   // ================= INTERVAL =================
-  if (r.type == RULE_INTERVAL) {
+  if (r.kind == ON_INTERVAL) {
     long interval_long = 0;
     if (!parseStrictLong(server.arg("interval"), interval_long)) {
       server.send(400, "text/plain", "invalid interval");
@@ -748,11 +816,60 @@ void handleSetRule() {
     server.send(400, "text/plain", "invalid delay/cooldown");
     return;
   }
-  r.delay_ms = delay_long;
+  r.fire_delay_ms = delay_long;
   r.cooldown_ms = cooldown_long;
+  // ================= OPCIONES NUEVAS (mitigacion / secuencia) =================
+  if (r.kind == ON_SAMPLE && server.hasArg("debounce_ms")) {
+    long db = 0;
+    if (!parseStrictLong(server.arg("debounce_ms"), db) || (db < 0 || db > 3600000)) {
+      server.send(400, "text/plain", "invalid debounce_ms");
+      return;
+    }
+    r.debounce_ms = db;
+  }
+  if (r.kind == ON_SAMPLE && server.hasArg("for_ms")) {
+    long fm = 0;
+    if (!parseStrictLong(server.arg("for_ms"), fm) || (fm < 0 || fm > 86400000)) {
+      server.send(400, "text/plain", "invalid for_ms");
+      return;
+    }
+    r.for_ms = fm;
+  }
+  if (r.kind == ON_SAMPLE && server.hasArg("hys")) {
+    long hy = 0;
+    if (!parseStrictLong(server.arg("hys"), hy) || (hy < 0 || hy > 255)) {
+      server.send(400, "text/plain", "invalid hys");
+      return;
+    }
+    r.c_hys_dec = hy;
+  }
+  if (server.hasArg("step_ms")) {
+    long sm = 0;
+    if (!parseStrictLong(server.arg("step_ms"), sm) || (sm < 0 || sm > 3600000)) {
+      server.send(400, "text/plain", "invalid step_ms");
+      return;
+    }
+    r.step_ms = sm;
+  }
+  if (server.hasArg("retry")) {
+    long rt = 0;
+    if (!parseStrictLong(server.arg("retry"), rt) || (rt < 0 || rt > 10)) {
+      server.send(400, "text/plain", "invalid retry");
+      return;
+    }
+    r.retry_max = rt;
+  }
+  if (server.hasArg("retry_interval")) {
+    long ri = 0;
+    if (!parseStrictLong(server.arg("retry_interval"), ri) || (ri < 0 || ri > 3600)) {
+      server.send(400, "text/plain", "invalid retry_interval");
+      return;
+    }
+    r.retry_interval_s = ri;
+  }
   saveRulesToEEPROM();
-  logger::eventf("Rule %d saved (type:%d, sensors:%d, actuators:%d)",
-    id, r.type, r.sensor_count, r.actuator_count);
+  logger::eventf("Rule %d saved (kind:%d, sensors:%d, actuators:%d)",
+    id, r.kind, r.sensor_count, r.actuator_count);
   server.send(200, "text/plain", "ok");
 }
 
