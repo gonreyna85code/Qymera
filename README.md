@@ -2,17 +2,17 @@
 
 Qymera turns your ESP8266 or ESP32 into a complete IoT node: reads sensors, controls actuators, and executes automation rules — all from a built-in web UI with EEPROM persistence and zero internet dependency after initial setup.
 
-**Status:** **Qymera 1.2 — GUI release** (this tree, `main` after merge). Built-in web GUI overhaul on top of the frozen Qymera 1.1 deterministic core: device cards, automation wizard, bilingual ES/EN UI, logs page. ESP8266 + ESP32 validated on real hardware (12 local + 11 remote entities each). Remaining items are hardware validation-only, inherited from the 1.1 baseline (24h memory soak, factory-reset hw test, longer endurance, extra ESP32-family hardware). | Built-in web server | UDP + ESP-NOW mesh | EEPROM/Preferences persistence | Arduino Library
+**Status:** **Qymera 1.0.0 - STABLE** (`main`, official repo `gonreyna85code/Qymera`). Web OTA self-update from GitHub Releases (manifest + SHA-256 verified over pinned TLS), bilingual ES/EN web GUI (device cards, automation wizard, logs), deterministic core (UDP + ESP-NOW mesh, EEPROM/Preferences, automations). ESP8266 + ESP32 validated on real hardware; ESP32-C3 build-verified.
 
 ## Versions & Branches
 
 | Version | Where | Status |
 |---------|-------|--------|
-| **Qymera 1.1** | historical `main` baseline | **FROZEN BASELINE** — deterministic core (deterministic runtime, UDP + ESP-NOW mesh, web server with basic UI, EEPROM/Preferences persistence, automations). Superseded as the active release by Qymera 1.2. |
-| **Qymera 1.2** | `main` (this tree) | **CURRENT RELEASE / GUI** — built-in web GUI overhaul (device cards, automation wizard, bilingual ES/EN, logs page) on top of the 1.1 deterministic core. Validated on ESP8266 + ESP32 hardware and full test/build matrix. |
-| **feature/GUI** | upstream GUI branch | Source of the 1.2 GUI work. Historical after this merge; **the deliverable is this main tree, not the branch.** |
-| **Qymera Dashboard** | `feature/ai-experiments` (+ future) | Separate, active development direction: optional external AI assistant + cloud dashboard. Kept out of the 1.1/1.2 production trees. |
-| **Qymera Link** | separate direction | Separate, active development direction: companion/link connectivity service. Kept out of the 1.1/1.2 production trees. |
+| **Qymera 1.0.0** | `main` (this tree) - official repo `gonreyna85code/Qymera` | **CURRENT RELEASE (STABLE)** - Web OTA from GitHub Releases (manifest + SHA-256 verified HTTPS download), web GUI (device cards, automation wizard, bilingual ES/EN, logs page), deterministic core (UDP + ESP-NOW mesh, EEPROM/Preferences, automations). Build matrix: ESP8266 x ESP32 x ESP32-C3. |
+| **Qymera 1.1 / 1.2** | historical `main` baseline | **FROZEN** - deterministic core + GUI work now shipped as 1.0.0. |
+| **Qymera Dashboard** | `feature/ai-experiments` (+ future) | Separate, active development direction: optional external AI assistant + cloud dashboard. Kept out of the production tree. |
+| **Qymera Link** | separate direction | Separate, active development direction: companion/link connectivity service. Kept out of the production tree. |
+
 
 ---
 
@@ -135,7 +135,7 @@ options).
 Sensor type enum (`/calib` JSON `type` field): 1=LUMI, 2=HUMI, 3=TEMP, 4=PRESS,
 5=LEVEL, 6=AIRQ, 7=RAIN, 8=DIMMER, 9=RELAY, 10=TIME, 11=GENERIC, 12=CONTACT.
 
-### New in 1.1: SETTINGS Navigation (Local / Remote)
+### New in 1.0: SETTINGS Navigation (Local / Remote)
 
 The **SETTINGS** tab now features collapsible sections:
 - **LOCAL** — entities with `calibration.local == true`
@@ -220,6 +220,22 @@ Key facts:
   `/calib`).
 - Rate limit: 6 requests / 2 s burst on state-changing endpoints (7th → `429`).
 - Full API reference and architecture: see `docs/architecture-baseline.md`.
+
+### Firmware Updates (Web OTA)
+
+The device can update itself over the internet from GitHub Releases without a cable. Release assets are published per platform along with a manifest that the device uses to fetch the correct binary.
+
+- Manifest: https://github.com/gonreyna85code/Qymera/releases/latest/download/qymera-manifest.json
+- Latest release: https://github.com/gonreyna85code/Qymera/releases
+- Assets: `Qymera-<version>-<platform>.bin` for `esp8266`, `esp32`, `esp32c3`.
+
+How it works:
+
+1. `POST /firmware/check` - the device fetches the manifest and compares versions; an update is offered only when a newer stable version exists.
+2. `POST /firmware/update` - the device streams the binary over HTTPS (trust anchors pinned in firmware: ISRG Root X1 + USERTrust ECC), verifies the SHA-256 and byte size from the manifest, writes flash, and reboots into the new version.
+3. The Settings > **Firmware** card in the web UI shows current/latest version and a live download progress bar. Raw status: `GET /firmware`.
+
+Security: HTTPS only with pinned CAs, integrity + size checks before install, auth and rate limits on state-changing endpoints, and strict version/platform gating (no downgrades, no cross-platform installs).
 
 ---
 
@@ -321,22 +337,17 @@ Issues and PRs welcome. To build and verify:
 pip install platformio
 pio run -t upload --monitor -e esp32_devkit   # ESP32
 pio run -e esp8266_generic                     # ESP8266
-python tests/host_sanity.py                    # host test suite (45 checks)
+python tests/host_sanity.py                    # host test suite (212 checks)
 ```
 
 ---
 
 ## Roadmap
 
-- **Qymera 1.1** (`main`) — frozen production baseline (code freeze).
-- **Qymera 1.2** (`feature/GUI`) — GUI release candidate: built-in web GUI
-  overhaul (device cards, automation wizard, bilingual ES/EN UI). Passed its
-  final freeze audit and is being prepared for a safe merge into `main`.
-- **Qymera Dashboard** — separate, active development direction (web/cloud
-  dashboard; optional external AI assistant subsystem authorized per
-  `AGENTS.md`, developed on `feature/ai-experiments`, kept out of 1.1/1.2).
-- **Qymera Link** — separate, active development direction (companion/link
-  connectivity service).
+- **Qymera 1.0.0** (`main`) - current stable release: Web OTA + web GUI on the deterministic core.
+- **Qymera Dashboard** - separate, active development direction (web/cloud dashboard; optional external AI assistant subsystem authorized per `AGENTS.md`, developed on `feature/ai-experiments`, kept out of production).
+- **Qymera Link** - separate, active development direction (companion/link connectivity service).
+
 - **Future:** MQTT · Zigbee/Z-Wave · Matter · graphing dashboard · email/SMS
   notifications · mobile app.
 

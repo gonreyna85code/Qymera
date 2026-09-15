@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: pio run -e esp8266_generic -e esp32_devkit -e esp32c3_devkit
+
+      - name: Host sanity tests
+        run: python tests/host_sanity.py
+
+      - name: Package assets + manifest
+        run: python scripts/ci_release.py "${{ github.ref_name }}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.bin
+            dist/qymera-manifest.json
+          generate_release_notes: true
