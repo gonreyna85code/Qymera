@@ -17,19 +17,8 @@ typedef ESP8266WebServer WebServerCompat;
 #define SET_AUTO_CONNECT() WiFi.setAutoConnect(true), WiFi.setAutoReconnect(true)
 #define RESET_MCU() ESP.reset()
 
-#elif defined(ESP32)
-#define PLATFORM_ESP32 1
-#include <WiFi.h>
-#include <WebServer.h>
-typedef WebServer WebServerCompat;
-#define ICACHE_FLASH IRAM_ATTR
-#define GET_CHIP_ID() ((uint32_t)ESP.getEfuseMac())
-#define SET_WIFI_SLEEP() WiFi.setSleep(false)
-#define SET_AUTO_CONNECT() WiFi.setAutoReconnect(true)
-#define RESET_MCU() ESP.restart()
-
-#elif defined(ESP32S2)
-#define PLATFORM_ESP32S2 1
+#elif defined(ESP32C3)
+#define PLATFORM_ESP32C3 1
 #include <WiFi.h>
 #include <WebServer.h>
 typedef WebServer WebServerCompat;
@@ -50,8 +39,19 @@ typedef WebServer WebServerCompat;
 #define SET_AUTO_CONNECT() WiFi.setAutoReconnect(true)
 #define RESET_MCU() ESP.restart()
 
-#elif defined(ESP32C3)
-#define PLATFORM_ESP32C3 1
+#elif defined(ESP32S2)
+#define PLATFORM_ESP32S2 1
+#include <WiFi.h>
+#include <WebServer.h>
+typedef WebServer WebServerCompat;
+#define ICACHE_FLASH IRAM_ATTR
+#define GET_CHIP_ID() ((uint32_t)ESP.getEfuseMac())
+#define SET_WIFI_SLEEP() WiFi.setSleep(false)
+#define SET_AUTO_CONNECT() WiFi.setAutoReconnect(true)
+#define RESET_MCU() ESP.restart()
+
+#elif defined(ESP32)
+#define PLATFORM_ESP32 1
 #include <WiFi.h>
 #include <WebServer.h>
 typedef WebServer WebServerCompat;

@@ -9,6 +9,7 @@
 #include "net.h"
 #include "automations.h"
 #include "storage.h"
+#include "firmware.h"
 #include "log.h"
 
 namespace core {
@@ -170,6 +171,7 @@ void begin() {
   uid = String(GET_CHIP_ID(), HEX);
   logger::init();
   logger::core("Boot");
+  logger::coref("Qymera %s (%s) - chip %s", QYMERA_VERSION_STRING, QYMERA_CHANNEL, uid.c_str());
   storage::loadCredentials(ssid, password);
   logger::core("Credentials loaded");
   storage::loadGeneralSettings(genset.broadcast_port, genset.command_port, genset.report_interval);
@@ -257,6 +259,9 @@ void loop() {
 
   /// 2) Poll WiFi connection state (non-blocking).
   checkWiFiStatus();
+
+  /// 2b) Web OTA driver (manifest check / streaming firmware download).
+  firmware::tick();
 
   /// 3) Reconexion si perdimos WiFi y paso el timeout definido.
   if (!wifi_connected && !wifi_connecting &&

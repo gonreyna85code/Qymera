@@ -4,7 +4,7 @@ namespace html_content {
 // ================= WEB ===================
 const char Styles[] PROGMEM = R"rawliteral(<!DOCTYPE html><html lang='es'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <meta name='color-scheme' content='dark light'>
-<title>Qymeras 1.1</title>
+<title>Qymera</title>
 <style>
 :root{
 --bg:#0d1117;--bg-2:#131922;--surface:#161d29;--surface-2:#1c2533;--surface-hover:#232f41;
@@ -242,7 +242,7 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
 const char Tabs[] PROGMEM = R"rawliteral(
 <div class="app">
 <header class="topbar">
-  <div class="brand"><span>Qymeras</span><span class="brand-sub">1.1</span></div>
+  <div class="brand"><span>Qymera</span><span class="brand-sub" id="brandSub">1.0.0</span></div>
   <div class="top-actions">
 <span class="status-chip" id="linkStatus"><span class="dot ok"></span><span data-i18n="chip.online">Online</span></span>
 <span class="status-chip" id="systemHealth" title="System health status"></span>
@@ -334,9 +334,9 @@ async function show(tab){
   localStorage.setItem('tab',tab);
   if(tab==='control') loadDevices();
   if(tab==='auto') loadRules();
-  if (tab === 'config'){ await loadCalib(); await syncOtaCheckbox(); }
+  if (tab === 'config'){ await loadCalib(); await syncOtaCheckbox(); await fwRefresh(); }
   if (tab === 'logs'){ refreshLogs(); startLogAutoRefresh(); }
-    else { stopLogAutoRefresh(); }
+    else { stopLogAutoRefresh(); if (fwPoll) { clearInterval(fwPoll); fwPoll = null; } }
 }
 
 /* -------------------- I18N -------------------- */
@@ -377,7 +377,7 @@ es: {
   localNet:'Error de red al contactar este dispositivo'}, factory:{
   confirm:'¿Seguro? Esto borrará todos los ajustes y la información.', doing:'Reiniciando...',
   err:'Error enviando reset'}, ota:{ enableMsg:'El dispositivo se reiniciará para activar OTA. ¿Continuar?',
-  disableMsg:'El dispositivo se reiniciará para desactivar OTA. ¿Continuar?'}, wiz:{
+  disableMsg:'El dispositivo se reiniciará para desactivar OTA. ¿Continuar?'}, fw:{ title:'Actualización de firmware', current:'Versión actual', channel:'Canal', latest:'Última versión', check:'Buscar actualizaciones', update:'Actualizar Qymera', checking:'Buscando actualizaciones...', upToDate:'Ya tienes la última versión', downloading:'Descargando {p}%', installing:'Instalando... no apagues el dispositivo', rebooting:'Reiniciando...', error:'Error: {msg}'}, wiz:{
   titleNew:'Nueva regla de automatización', titleEdit:'Editar regla de automatización', cancel:'Cancelar',
   back:'Atrás', next:'Siguiente', save:'Guardar', type:'Tipo de regla',
   edge:'EDGE - Cambios de estado', 'edge.desc':'Se ejecuta cuando un sensor cambia de estado',
@@ -440,7 +440,7 @@ en: {
   localNet:'Network error contacting this device'}, factory:{
   confirm:'Are you sure? This will erase all settings and data.', doing:'Restarting...',
   err:'Error sending reset'}, ota:{ enableMsg:'The device will restart to enable OTA. Continue?',
-  disableMsg:'The device will restart to disable OTA. Continue?'}, wiz:{
+  disableMsg:'The device will restart to disable OTA. Continue?'}, fw:{ title:'Firmware update', current:'Current version', channel:'Channel', latest:'Latest version', check:'Check for updates', update:'Update Qymera', checking:'Checking for updates...', upToDate:'You are up to date', downloading:'Downloading {p}%', installing:'Installing... do not power off', rebooting:'Rebooting...', error:'Error: {msg}'}, wiz:{
   titleNew:'New automation rule', titleEdit:'Edit automation rule', cancel:'Cancel',
   back:'Back', next:'Next', save:'Save', type:'Rule type',
   edge:'EDGE - State changes', 'edge.desc':'Runs when a sensor changes state',
@@ -1051,6 +1051,25 @@ async function loadCalib() {
             </form>
             <p class="small-note" style="margin:12px 0 0">${t('net.note')}</p>
           </div>
+          <div class="settings-card" id="fwCard">
+            <div class="settings-card-head">
+              <div><span class="eyebrow">FIRMWARE</span><h3>${t('fw.title')}</h3></div>
+            </div>
+            <div class="kv"><span>${t('fw.current')}</span><b><span id="fwCurrent">—</span></b></div>
+            <div class="kv"><span>${t('fw.channel')}</span><b><span id="fwChannel">—</span></b></div>
+            <div class="kv"><span>${t('fw.latest')}</span><b><span id="fwLatest">—</span></b></div>
+            <div id="fwError" class="small-note" style="display:none;color:#d64545"></div>
+            <div id="fwProgressWrap" style="display:none">
+              <div style="height:8px;background:var(--border);border-radius:999px;overflow:hidden">
+                <div id="fwProgress" style="height:100%;width:0%;background:var(--accent);transition:width .3s"></div>
+              </div>
+              <div id="fwProgressLabel" class="small-note" style="margin-top:6px"></div>
+            </div>
+            <div class="btn-row">
+              <button class="btn primary" id="fwCheckBtn" onclick="fwCheck()">${t('fw.check')}</button>
+              <button class="btn primary" id="fwUpdateBtn" style="display:none" onclick="fwUpdate()">${t('fw.update')}</button>
+            </div>
+          </div>
           ${cardRenderers.DEFAULT(
             { value: 0, min: 0, max: 0 },
             data.length
@@ -1435,6 +1454,75 @@ async function syncOtaCheckbox() {
   }
 }
 
+
+/* -------------------- WEB OTA (FIRMWARE) -------------------- */
+
+let fwPoll = null;
+
+async function fwRefresh() {
+  let j = null;
+  try {
+    const r = await fetch('/firmware');
+    j = await r.json();
+  } catch (e) { return; }
+  const sub = document.getElementById('brandSub');
+  if (sub && j.version) sub.innerText = j.version;
+  const card = document.getElementById('fwCard');
+  if (!card) return;
+  const cur = document.getElementById('fwCurrent');
+  const lat = document.getElementById('fwLatest');
+  const cha = document.getElementById('fwChannel');
+  const err = document.getElementById('fwError');
+  const wrap = document.getElementById('fwProgressWrap');
+  const bar = document.getElementById('fwProgress');
+  const lbl = document.getElementById('fwProgressLabel');
+  const checkBtn = document.getElementById('fwCheckBtn');
+  const updBtn = document.getElementById('fwUpdateBtn');
+  if (cur) cur.innerText = j.version || '-';
+  if (cha) cha.innerText = j.channel || '-';
+  if (lat) lat.innerText = j.latest || '-';
+  if (err) {
+    err.style.display = j.error ? '' : 'none';
+    err.innerText = j.error ? tf('fw.error', { msg: j.error }) : '';
+  }
+  if (updBtn) updBtn.style.display = (j.state === 'ready' && j.available) ? '' : 'none';
+  const busy = j.state === 'checking' || j.state === 'downloading' || j.state === 'installing';
+  if (checkBtn) {
+    checkBtn.disabled = busy;
+    checkBtn.innerText = (j.state === 'checking') ? t('fw.checking') : t('fw.check');
+  }
+  if (wrap && bar && lbl) {
+    const show = j.state === 'checking' || j.state === 'downloading' || j.state === 'installing';
+    wrap.style.display = show ? '' : 'none';
+    bar.style.width = (j.progress || 0) + '%';
+    if (j.state === 'downloading') lbl.innerText = tf('fw.downloading', { p: j.progress });
+    else if (j.state === 'installing') lbl.innerText = t('fw.installing');
+    else if (j.state === 'checking') lbl.innerText = t('fw.checking');
+  }
+  if (busy) {
+    if (!fwPoll) fwPoll = setInterval(fwRefresh, 700);
+  } else {
+    if (fwPoll) { clearInterval(fwPoll); fwPoll = null; }
+  }
+}
+
+async function fwCheck() {
+  if (fwPoll) return;
+  try {
+    const r = await fetch('/firmware/check');
+    const j = await r.json();
+    if (j.ok) fwRefresh();
+  } catch (e) { showToast('error', t('alert.localNet')); }
+}
+
+async function fwUpdate() {
+  try {
+    const r = await fetch('/firmware/update', { method: 'POST' });
+    const j = await r.json();
+    if (!j.ok) { showToast('error', t('alert.localNet')); return; }
+    fwRefresh();
+  } catch (e) { showToast('error', t('alert.localNet')); }
+}
 /* -------------------- THEMES -------------------- */
 
 const THEME_MAP = {

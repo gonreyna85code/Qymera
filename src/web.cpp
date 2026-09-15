@@ -8,6 +8,7 @@
 #include "sensors.h"
 #include "automations.h"
 #include "storage.h"
+#include "firmware.h"
 #include "log.h"
 
 #ifndef ICACHE_FLASH_ATTR
@@ -364,6 +365,64 @@ void handleOtaToggle() {
 void handleOtaStatus() {
   addCorsHeaders();
   server.send(200, "application/json", core::isOtaEnabled() ? "{\"ota\":1}" : "{\"ota\":0}");
+}
+
+void handleFirmware() {
+  addCorsHeaders();
+  String j;
+  j.reserve(200);
+  j = "{\"product\":\"";
+  j += QYMERA_PRODUCT;
+  j += "\",\"version\":\"";
+  j += firmware::currentVersion();
+  j += "\",\"platform\":\"";
+#if defined(PLATFORM_ESP8266)
+  j += "esp8266";
+#elif defined(PLATFORM_ESP32C3)
+  j += "esp32c3";
+#else
+  j += "esp32";
+#endif
+  j += "\",\"state\":\"";
+  j += firmware::stateToken();
+  j += "\",\"latest\":\"";
+  j += firmware::latestVersion();
+  j += "\",\"channel\":\"";
+  j += firmware::channel();
+  j += "\",\"available\":";
+  j += firmware::updateAvailable() ? "1" : "0";
+  j += ",\"progress\":";
+  j += String(firmware::progressPercent());
+  j += ",\"error\":\"";
+  j += firmware::errorMessage();
+  j += "\"}";
+  server.send(200, "application/json", j);
+}
+
+void handleFirmwareCheck() {
+  addCorsHeaders();
+  if (firmware::requestCheck()) {
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+  }
+}
+
+void handleFirmwareUpdate() {
+  addCorsHeaders();
+  if (!checkAuth()) {
+    server.send(401, "text/plain", "Authentication required");
+    return;
+  }
+  if (!checkRateLimit()) {
+    server.send(429, "text/plain", "rate limited");
+    return;
+  }
+  if (firmware::requestUpdate()) {
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"not_available\"}");
+  }
 }
 
 ICACHE_FLASH_ATTR void loadCalibration() {
@@ -1144,6 +1203,10 @@ void init() {
   server.on("/logs/clear", HTTP_POST, handleLogsClear);
   server.on("/ota/toggle", handleOtaToggle);
   server.on("/ota/status", handleOtaStatus);
+  server.on("/firmware", handleFirmware);
+  server.on("/firmware/check", handleFirmwareCheck);
+  server.on("/firmware/update", HTTP_POST, handleFirmwareUpdate);
+  server.on("/firmware/update", HTTP_OPTIONS, handleCorsOptions);
   server.begin();
 }
 
