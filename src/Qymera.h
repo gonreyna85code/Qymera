@@ -59,7 +59,7 @@ inline void startFade(const String &key, uint8_t pin, int from, int to, unsigned
 
 // ---- calibration ----
 inline float calibrate(const String &key, float raw)                      { return sensors::calibrate(key, raw); }
-inline sensors::Calibration *getCalib(const String &key)                  { return sensors::getCalib(key); }
+inline qymera::model::Entity *getCalib(const String &key)                 { return sensors::getCalib(key); }
 
 // ---- time ----
 inline void rtc(const sensors::RTCTime &time) { sensors::rtc(time); }

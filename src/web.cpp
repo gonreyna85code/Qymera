@@ -4,6 +4,8 @@
 #include "web.h"
 #include "html.h"
 #include "core.h"
+#include "entities.h"
+#include "model.h"
 #include "net.h"
 #include "sensors.h"
 #include "automations.h"
@@ -16,6 +18,7 @@
 #endif
 
 namespace web {
+using namespace qymera::model;
 WebServerCompat server(80);
 
 static const char* AUTH_USERNAME = "admin";
@@ -282,13 +285,14 @@ void handleToggleApi() {
     return;
   }
   uint32_t id = (uint32_t)id_ul;
-  int idx = sensors::findCalibByUid(id);
+  int idx = entities::findById(id);
   if (idx < 0) {
     server.send(404, "text/plain", "id not found");
     return;
   }
-  auto &c = sensors::calibrations[idx];
-  if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) {
+  const Entity &c = entities::peek((uint8_t)idx);
+  if (qymera::model::capabilityOfType(c.config.type) !=
+      EntityCapability::READ_WRITE) {
     server.send(400, "text/plain", "invalid actuator type");
     return;
   }
@@ -312,12 +316,12 @@ void handleDimmerApi() {
     return;
   }
   uint32_t id = (uint32_t)id_ul;
-  int idx = sensors::findCalibByUid(id);
+  int idx = entities::findById(id);
   if (idx < 0) {
     server.send(404, "text/plain", "id not found");
     return;
   }
-  if (sensors::calibrations[idx].type != sensors::TYPE_DIMMER) {
+  if (entities::peek((uint8_t)idx).config.type != TYPE_DIMMER) {
     server.send(400, "text/plain", "invalid actuator type");
     return;
   }
@@ -659,7 +663,7 @@ void handleSetRule() {
         return;
       }
       int sensor_id = (int)sensor_ul;
-      if (sensors::calibrations[sensor_id].uid == 0) {
+      if (!entities::isUsed((uint8_t)sensor_id)) {
         server.send(400, "text/plain", "sensor not configured");
         return;
       }
@@ -727,12 +731,13 @@ void handleSetRule() {
         return;
       }
       int actuator_id = (int)actuator_ul;
-      auto &cal = sensors::calibrations[actuator_id];
-      if (cal.uid == 0) {
+      if (!entities::isUsed((uint8_t)actuator_id)) {
         server.send(400, "text/plain", "actuator not configured");
         return;
       }
-      if (cal.type != sensors::TYPE_RELAY && cal.type != sensors::TYPE_DIMMER) {
+      const Entity &cal = entities::peek((uint8_t)actuator_id);
+      if (qymera::model::capabilityOfType(cal.config.type) !=
+          EntityCapability::READ_WRITE) {
         server.send(400, "text/plain", "invalid actuator type");
         return;
       }
@@ -751,7 +756,7 @@ void handleSetRule() {
           server.send(400, "text/plain", "invalid action");
           return;
         }
-        if (action == ACT_LEVEL && cal.type != sensors::TYPE_DIMMER) {
+        if (action == ACT_LEVEL && cal.config.type != TYPE_DIMMER) {
           server.send(400, "text/plain", "LEVEL only for dimmers");
           return;
         }
@@ -943,57 +948,56 @@ ICACHE_FLASH_ATTR void handleCalib() {
   json += '[';
   bool firstObj = true;
   for (int i = 0; i < MAX_SENSORS; i++) {
-    auto &c = sensors::calibrations[i];
-    auto &r = net::reports[i];
-    // Expose only active, well-formed entries: valid uid, valid type, and
-    // remote entries that are still within NET_TIMEOUT. Stale remote sensors,
+    const Entity &c = entities::peek((uint8_t)i);
+    // Expose only active, well-formed entries: valid entity id, valid type,
+    // and remote entries that are still within NET_TIMEOUT. Stale remotes,
     // SENSOR_NONE and invalid/garbage types are never reported as devices.
-    if (!sensors::isEntryVisible(i)) continue;
+    if (!entities::isVisible((uint8_t)i)) continue;
     if (!firstObj) json += ',';
     firstObj = false;
 
     char buf[24];
-    if (isnan(r.value) || isinf(r.value)) {
+    if (isnan(c.state.value) || isinf(c.state.value)) {
       strcpy(buf, "0");
     } else {
-      dtostrf(r.value, 0, 4, buf);
+      dtostrf(c.state.value, 0, 4, buf);
     }
 
     json += "{\"id\":";
-    json += c.uid;
+    json += c.identity.entity_id;
     json += ",\"index\":";
     json += i;
     json += ",\"device_uid\":";
-    json += c.device_uid;
+    json += (c.runtime.local ? GET_CHIP_ID() : c.identity.device_id);
     json += ",\"name\":\"";
-    json += c.name;
+    json += c.config.name;
     json += "\",\"value\":";
     json += buf;
 
     char fb[24];
-    dtostrf(isnan(c.correction) || isinf(c.correction) ? 0.0f : c.correction, 0, 4, fb); json += ",\"correction\":";  json += fb;
+    dtostrf(isnan(c.config.correction) || isinf(c.config.correction) ? 0.0f : c.config.correction, 0, 4, fb); json += ",\"correction\":";  json += fb;
 
-    json += ",\"avail\":";           json += c.avail;
-    json += ",\"pulse\":";           json += (c.pulse ? "true" : "false");
-    json += ",\"state\":";           json += (r.state ? "true" : "false");
-    json += ",\"pulse_ms\":";        json += c.pulse_ms;
-    json += ",\"persist\":";         json += (c.persist ? "true" : "false");
-    json += ",\"fade\":";            json += c.fade;
-    json += ",\"type\":";            json += c.type;
-    json += ",\"local\":";           json += (c.local ? "true" : "false");
+    json += ",\"avail\":";           json += c.state.avail;
+    json += ",\"pulse\":";           json += (c.config.pulse ? "true" : "false");
+    json += ",\"state\":";           json += (c.state.state ? "true" : "false");
+    json += ",\"pulse_ms\":";        json += c.config.pulse_ms;
+    json += ",\"persist\":";         json += (c.config.persist ? "true" : "false");
+    json += ",\"fade\":";            json += c.config.fade;
+    json += ",\"type\":";            json += c.config.type;
+    json += ",\"local\":";           json += (c.runtime.local ? "true" : "false");
     // Elapsed ms since the last remote packet, computed server-side from the
     // same millis() timebase as NET_TIMEOUT (client Date.now() is epoch-based
     // and cannot be compared directly with the device uptime counter).
-    json += ",\"age_ms\":";          json += c.local ? 0 : (uint32_t)(millis() - c.last_update);
+    json += ",\"age_ms\":";          json += (uint32_t)(millis() - c.state.last_update);
 
     json += ",\"ip\":\"";
-    if (c.local) {
+    if (c.runtime.local) {
       IPAddress ip = WiFi.localIP();
       char ipbuf[16];
       snprintf(ipbuf, sizeof(ipbuf), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
       json += ipbuf;
     } else {
-      json += c.device_ip;
+      json += c.runtime.device_ip;
     }
     json += "\"}";
   }
@@ -1026,14 +1030,17 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
   }
   uint32_t sensorUid = (uint32_t)sensorUidUl;
   String type = server.arg("type");
-  int calibIdx = sensors::findCalibByUid(sensorUid);
+  int calibIdx = entities::findById(sensorUid);
   if (calibIdx < 0) {
     server.send(400, "text/plain", "Sensor not found");
     return;
   }
-  auto &c = sensors::calibrations[calibIdx];
-  auto &r = net::reports[calibIdx];
-  float raw = r.raw;
+  Entity &c = entities::at((uint8_t)calibIdx);
+  if (!c.runtime.local) {
+    server.send(400, "text/plain", "Remote entity config is read-only");
+    return;
+  }
+  float raw = c.state.raw;
 
   // TIME / timezone: strict integer minutes from UTC, range -720..840.
   if (type == "TIME" || type == "timezone") {
@@ -1050,7 +1057,7 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
       server.send(400, "text/plain", "timezone out of range (-720..840)");
       return;
     }
-    c.correction = (float)tz_min;
+    c.config.correction = (float)tz_min;
     saveCalibrationSlot(calibIdx);
     server.send(200, "text/plain", "OK");
     return;
@@ -1068,12 +1075,12 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
       return;
     }
     bool enable = (pv == "1");
-    c.persist = enable;
-    c.pulse = false;
+    c.config.persist = enable;
+    c.config.pulse = false;
     // Snapshot the live state at enable time so a reboot right after enabling
     // persistence still restores the current relay state (the state is only
     // re-saved on subsequent toggles while persist is on).
-    if (enable) c.pers_state = c.state;
+    if (enable) c.config.pers_state = c.state.state;
     saveCalibrationSlot(calibIdx);
     server.send(200, "text/plain", "OK");
     return;
@@ -1090,7 +1097,7 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
       server.send(400, "text/plain", "invalid avail value (0/1)");
       return;
     }
-    c.avail = (av == "1") ? 1 : 0;
+    c.state.avail = (av == "1") ? 1 : 0;
     saveCalibrationSlot(calibIdx);
     server.send(200, "text/plain", "OK");
     return;
@@ -1098,9 +1105,9 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
 
   // res: no payload needed.
   if (type == "res") {
-    c.min = 0;
-    c.max = 100;
-    c.correction = 0;
+    c.config.min = 0;
+    c.config.max = 100;
+    c.config.correction = 0;
     saveCalibrationSlot(calibIdx);
     server.send(200, "text/plain", "OK");
     return;
@@ -1121,7 +1128,7 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
       server.send(400, "text/plain", "fade out of range (0..3600000 ms)");
       return;
     }
-    c.fade = (uint32_t)fad;
+    c.config.fade = (uint32_t)fad;
     saveCalibrationSlot(calibIdx);
     server.send(200, "text/plain", "OK");
     return;
@@ -1142,9 +1149,9 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
       server.send(400, "text/plain", "pulse out of range (0..3600000 ms)");
       return;
     }
-    c.pulse_ms = (uint32_t)pms;
-    c.pulse = (pms > 0);
-    c.persist = false;
+    c.config.pulse_ms = (uint32_t)pms;
+    c.config.pulse = (pms > 0);
+    c.config.persist = false;
     saveCalibrationSlot(calibIdx);
     server.send(200, "text/plain", "OK");
     return;
@@ -1165,16 +1172,16 @@ ICACHE_FLASH_ATTR void handleCalibSet() {
   }
 
   if (type == "ref") {
-    if (ref == 0) c.correction = 0;
+    if (ref == 0) c.config.correction = 0;
     else {
-      if (c.type == sensors::SENSOR_LUMI)
+      if (c.config.type == SENSOR_LUMI)
         ref = ref * 7074.0f / 108.9432f;
-      c.correction = ref - raw;
+      c.config.correction = ref - raw;
     }
   } else if (type == "min") {
-    c.min = raw + c.correction;
+    c.config.min = raw + c.config.correction;
   } else if (type == "max") {
-    c.max = raw + c.correction;
+    c.config.max = raw + c.config.correction;
   } else {
     server.send(400, "text/plain", "Bad type");
     return;

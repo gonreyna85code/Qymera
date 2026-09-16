@@ -145,6 +145,10 @@ typedef WebServer WebServerCompat;
 #define BROADCAST_INTERVAL 5000
 #define WIFI_RETRY_INTERVAL 180000
 
+/* Remote entity stale threshold (ms): used by the entity registry for the
+   remote lifecycle (STALE -> reclaim) and by the web API for age_ms. */
+#define NET_TIMEOUT 30000
+
 /* =========================
    PWM ABSTRACTION (0-255, 8-bit)
    ESP8266: default analogWrite range is 1023 (10-bit)

@@ -5,6 +5,7 @@
 #include "core.h"
 #include "config.h"
 #include "web.h"
+#include "entities.h"
 #include "sensors.h"
 #include "net.h"
 #include "automations.h"
@@ -288,7 +289,7 @@ void loop() {
   /// 4) Tareas periódicas: clock NTP, net tick, automatización.
   sensors::updateNTPTime();
   net::tick(millis());
-  sensors::reclaimStaleSlots();
+  entities::reclaimStale();
   automations::tick(millis());
   sensors::applyFades();
   sensors::checkPulses();

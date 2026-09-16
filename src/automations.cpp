@@ -1,9 +1,12 @@
 #include "automations.h"
+#include "entities.h"
 #include "sensors.h"
 #include "log.h"
 #include "storage.h"
 
 namespace automations {
+
+using namespace qymera::model;
 
 // ----------------- REGLAS -----------------
 
@@ -18,24 +21,30 @@ static bool executeAction(const Automation &a, uint8_t index) {
   if (index >= a.actuator_count) return true;
   uint8_t idx = a.a_sensor[index];
   if (idx >= MAX_SENSORS) return false;
-  auto &c = sensors::calibrations[idx];
-  if (c.uid == 0) return false;
+  const Entity &c = entities::peek(idx);
+  if (!entities::isUsed(idx) || c.identity.entity_id == 0) return false;
+  const uint8_t type = c.config.type;
+  const bool state = c.state.state;
+  const uint32_t entity_id = c.identity.entity_id;
   switch (a.a_action[index]) {
     case ACT_ON:
-      if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) return false;
-      if (!c.state) sensors::handleToggle(c.uid);
+      if (!qymera::model::isValidType(type) ||
+          qymera::model::capabilityOfType(type) != EntityCapability::READ_WRITE) return false;
+      if (!state) sensors::handleToggle(entity_id);
       return true;
     case ACT_OFF:
-      if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) return false;
-      if (c.state) sensors::handleToggle(c.uid);
+      if (!qymera::model::isValidType(type) ||
+          qymera::model::capabilityOfType(type) != EntityCapability::READ_WRITE) return false;
+      if (state) sensors::handleToggle(entity_id);
       return true;
     case ACT_TOGGLE:
-      if (c.type != sensors::TYPE_RELAY && c.type != sensors::TYPE_DIMMER) return false;
-      sensors::handleToggle(c.uid);
+      if (!qymera::model::isValidType(type) ||
+          qymera::model::capabilityOfType(type) != EntityCapability::READ_WRITE) return false;
+      sensors::handleToggle(entity_id);
       return true;
     case ACT_LEVEL:
-      if (c.type != sensors::TYPE_DIMMER) return false;
-      sensors::handleDimmer(c.uid, a.a_level[index]);
+      if (type != TYPE_DIMMER) return false;
+      sensors::handleDimmer(entity_id, a.a_level[index]);
       return true;
     default:
       return false;
@@ -97,9 +106,10 @@ void tick(uint32_t now_ms) {
     if (isSample) {
       CondSample smp[MAX_CONDITIONS];
       for (int j = 0; j < (int)a.sensor_count && j < MAX_CONDITIONS; j++) {
-        if (a.c_sensor[j] < MAX_SENSORS) {
-          smp[j].value = sensors::calibrations[a.c_sensor[j]].value;
-          smp[j].state = sensors::calibrations[a.c_sensor[j]].state;
+        if (a.c_sensor[j] < MAX_SENSORS && entities::isUsed(a.c_sensor[j])) {
+          const Entity &c = entities::peek(a.c_sensor[j]);
+          smp[j].value = c.state.value;
+          smp[j].state = c.state.state;
         } else {
           smp[j].value = 0;
           smp[j].state = false;

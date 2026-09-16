@@ -2,12 +2,15 @@
 #include "config.h"
 #include "core.h"
 #include "sensors.h"
+#include "entities.h"
 #include "log.h"
 #include "model.h"
 #include "cmd_delivery.h"
 #include "transport.h"
 
 namespace net {
+
+using namespace qymera::model;
 
 // Wire-format guards: any change to the packed structs that alters their size
 // must be reviewed against parseBuffer/senders (protocol compatibility).
@@ -19,7 +22,6 @@ static_assert(sizeof(PacketV4) == 47, "PacketV4 must be 47 bytes");
 static_assert(sizeof(Packet) == 58, "Packet must be 58 bytes");
 static_assert(sizeof(LogPacket) == 66, "LogPacket must be 66 bytes");
 
-ReportEntry reports[MAX_SENSORS];
 float MIN_VAL = -50.0f;
 float MAX_VAL = 150.0f;
 static RemoteDevice remote_devices[MAX_SENSORS];
@@ -415,14 +417,6 @@ bool isDeviceOnline(uint32_t uid) {
   return dev != nullptr && dev->online;
 }
 
-void setReport(uint8_t index, uint32_t uid, float value, float raw, bool state) {
-  if (index >= MAX_SENSORS) return;
-  reports[index].uid = uid;
-  reports[index].value = value;
-  reports[index].raw = raw;
-  reports[index].state = state;
-}
-
 uint32_t encodeFloat(float v) {
   if (v < MIN_VAL) v = MIN_VAL;
   if (v > MAX_VAL) v = MAX_VAL;
@@ -453,25 +447,25 @@ void sendCommand(uint32_t remote_uid, const char *remote_ip, uint32_t sensor_id,
   qymera::transport::unicast(remote_ip, buf, sizeof(buf));
 }
 
-static void fillPacket(const sensors::Calibration &c, Packet &pkt) {
+static void fillPacket(const Entity &c, Packet &pkt) {
   memset(&pkt, 0, sizeof(pkt));
-  pkt.id = c.uid;
-  pkt.type = c.type;
-  pkt.state = c.state ? 1 : 0;
-  pkt.min = c.min;
-  pkt.max = c.max;
-  pkt.correction = c.correction;
-  pkt.avail = c.avail;
-  pkt.fade = c.fade;
-  pkt.persist = c.persist ? 1 : 0;
-  pkt.pers_state = c.pers_state ? 1 : 0;
-  pkt.pulse = c.pulse ? 1 : 0;
-  pkt.pulse_ms = c.pulse_ms;
-  strncpy(pkt.name, c.name.c_str(), sizeof(pkt.name) - 1);
-  if (c.type == sensors::SENSOR_LUMI || c.type == sensors::SENSOR_TIME) {
-    pkt.value = (uint32_t)c.value;
+  pkt.id = c.identity.entity_id;
+  pkt.type = c.config.type;
+  pkt.state = c.state.state ? 1 : 0;
+  pkt.min = c.config.min;
+  pkt.max = c.config.max;
+  pkt.correction = c.config.correction;
+  pkt.avail = c.state.avail;
+  pkt.fade = c.config.fade;
+  pkt.persist = c.config.persist ? 1 : 0;
+  pkt.pers_state = c.config.pers_state ? 1 : 0;
+  pkt.pulse = c.config.pulse ? 1 : 0;
+  pkt.pulse_ms = c.config.pulse_ms;
+  strncpy(pkt.name, c.config.name, sizeof(pkt.name) - 1);
+  if (c.config.type == SENSOR_LUMI || c.config.type == SENSOR_TIME) {
+    pkt.value = (uint32_t)c.state.value;
   } else {
-    pkt.value = encodeFloat(c.value);
+    pkt.value = encodeFloat(c.state.value);
   }
 }
 
@@ -497,8 +491,9 @@ void sendBinaryReport() {
     int sensor_count = 0;
     const int header_size = sizeof(PacketHeaderV4);
     for (int i = 0; i < MAX_SENSORS; i++) {
-      auto &c = sensors::calibrations[i];
-      if (!c.local || c.type == sensors::SENSOR_NONE || c.uid == 0) continue;
+      const Entity &c = entities::at((uint8_t)i);
+      if (!entities::isLocal((uint8_t)i)) continue;
+      if (c.config.type == SENSOR_NONE || c.identity.entity_id == 0) continue;
       if (sensor_count > 0 &&
           header_size + (sensor_count + 1) * sizeof(Packet) > DISCOVERY_MAX_UDP_PACKET) {
         sendUdpBatch(batch, sensor_count);
@@ -513,8 +508,9 @@ void sendBinaryReport() {
   } else {
     // ESP-NOW: one entity per broadcast (RX side uses a 250-byte buffer).
     for (int i = 0; i < MAX_SENSORS; i++) {
-      auto &c = sensors::calibrations[i];
-      if (!c.local || c.type == sensors::SENSOR_NONE || c.uid == 0) continue;
+      const Entity &c = entities::at((uint8_t)i);
+      if (!entities::isLocal((uint8_t)i)) continue;
+      if (c.config.type == SENSOR_NONE || c.identity.entity_id == 0) continue;
       PacketHeaderV4 hdr;
       hdr.magic = 0xA5;
       hdr.version = PACKET_VERSION;
@@ -576,35 +572,35 @@ void sendV2Hello() {
 
 void sendV2EntityAnnounce(uint8_t index) {
   if (index >= MAX_SENSORS) return;
-  auto &c = sensors::calibrations[index];
-  if (!c.local || c.type == sensors::SENSOR_NONE || c.uid == 0) return;
-  if (c.entity_id == 0) return;  // not yet assigned
+  const Entity &c = entities::at(index);
+  if (!entities::isLocal(index)) return;
+  if (c.config.type == SENSOR_NONE || c.identity.entity_id == 0) return;
 
   using namespace qymera::protocol::v2;
   EntityAnnouncePayload eap = {};
-  eap.entity_id = c.entity_id;
+  eap.entity_id = c.identity.entity_id;
   eap.device_id = GET_CHIP_ID();
-  eap.type = c.type;
+  eap.type = c.config.type;
   // Map capabilities
-  switch (c.type) {
-    case sensors::TYPE_RELAY:
-    case sensors::TYPE_DIMMER:
-      eap.capabilities = (uint8_t)qymera::model::EntityCapability::READ_WRITE;
+  switch (c.config.type) {
+    case TYPE_RELAY:
+    case TYPE_DIMMER:
+      eap.capabilities = (uint8_t)EntityCapability::READ_WRITE;
       break;
     default:
-      eap.capabilities = (uint8_t)qymera::model::EntityCapability::READ;
+      eap.capabilities = (uint8_t)EntityCapability::READ;
   }
-  eap.ownership = (uint8_t)qymera::model::EntityOwnership::OWNER_LOCAL;
-  strncpy(eap.name, c.name.c_str(), sizeof(eap.name) - 1);
-  eap.min = c.min;
-  eap.max = c.max;
-  eap.correction = c.correction;
-  eap.avail = c.avail;
-  eap.persist = c.persist ? 1 : 0;
-  eap.pers_state = c.pers_state ? 1 : 0;
-  eap.pulse = c.pulse ? 1 : 0;
-  eap.pulse_ms = c.pulse_ms;
-  eap.fade = c.fade;
+  eap.ownership = (uint8_t)EntityOwnership::OWNER_LOCAL;
+  strncpy(eap.name, c.config.name, sizeof(eap.name) - 1);
+  eap.min = c.config.min;
+  eap.max = c.config.max;
+  eap.correction = c.config.correction;
+  eap.avail = c.state.avail;
+  eap.persist = c.config.persist ? 1 : 0;
+  eap.pers_state = c.config.pers_state ? 1 : 0;
+  eap.pulse = c.config.pulse ? 1 : 0;
+  eap.pulse_ms = c.config.pulse_ms;
+  eap.fade = c.config.fade;
 
   uint8_t buf[sizeof(Envelope) + sizeof(EntityAnnouncePayload)];
   uint16_t frame_len = buildFrame(buf, sizeof(buf),
@@ -618,18 +614,18 @@ void sendV2EntityAnnounce(uint8_t index) {
 
 void sendV2StateUpdate(uint8_t index) {
   if (index >= MAX_SENSORS) return;
-  auto &c = sensors::calibrations[index];
-  if (!c.local || c.type == sensors::SENSOR_NONE || c.uid == 0) return;
-  if (c.entity_id == 0) return;
+  const Entity &c = entities::at(index);
+  if (!entities::isLocal(index)) return;
+  if (c.config.type == SENSOR_NONE || c.identity.entity_id == 0) return;
 
   using namespace qymera::protocol::v2;
   StateUpdatePayload sup = {};
-  sup.entity_id = c.entity_id;
-  sup.value = (c.type == sensors::SENSOR_LUMI || c.type == sensors::SENSOR_TIME)
-                ? (uint32_t)c.value
-                : encodeFloat(c.value);
-  sup.state = c.state ? 1 : 0;
-  sup.avail = c.avail;
+  sup.entity_id = c.identity.entity_id;
+  sup.value = (c.config.type == SENSOR_LUMI || c.config.type == SENSOR_TIME)
+                ? (uint32_t)c.state.value
+                : encodeFloat(c.state.value);
+  sup.state = c.state.state ? 1 : 0;
+  sup.avail = c.state.avail;
 
   uint8_t buf[sizeof(Envelope) + sizeof(StateUpdatePayload)];
   uint16_t frame_len = buildFrame(buf, sizeof(buf),

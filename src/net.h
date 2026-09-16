@@ -82,19 +82,6 @@ typedef void (*V2CommandErrorCallback)(
   const qymera::protocol::v2::CommandErrorPayload &payload);
 
 // ============================================================================
-// Reportes
-// ============================================================================
-
-struct ReportEntry {
-  uint32_t uid;
-  float value;
-  float raw;
-  bool state;
-};
-
-extern ReportEntry reports[MAX_SENSORS];
-
-// ============================================================================
 // Protocolo
 // ============================================================================
 
@@ -182,12 +169,10 @@ struct Packet {
 // API pública
 // ============================================================================
 
-void setReport(
-  uint8_t index,
-  uint32_t uid,
-  float value,
-  float raw,
-  bool state);
+/* Legacy fixed wire-encoding range for float->uint32 (fillPacket/decode).
+   Single source of truth; replaced by the wire-format redesign (Phase 4). */
+extern float MIN_VAL;
+extern float MAX_VAL;
 
 uint32_t encodeFloat(float v);
 
@@ -264,8 +249,6 @@ bool isDeviceOnline(uint32_t uid);
 // ============================================================================
 // Config
 // ============================================================================
-
-#define NET_TIMEOUT 30000
 
 // Discovery UDP batching: one datagram carries multiple local entities instead
 // of one datagram per sensor. The limit keeps a batch below the Ethernet MTU to

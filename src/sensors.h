@@ -1,50 +1,22 @@
 #pragma once
 #include <Arduino.h>
 #include "config.h"
+#include "model.h"
+#include "entities.h"
 #include "protocol_v2.h"
+
+// ================================================================
+// SENSOR / ACTUATOR FACADE (v1)
+//
+// Thin hardware-facing layer on top of the entity registry. Entities
+// (state + config) live in `entities`; this module only owns the
+// hardware I/O (GPIO, PWM, fades, pulses, clock) and the sensor-type
+// classification helpers. No entity state is stored here.
+// ================================================================
 
 namespace sensors {
 
-enum SensorType : uint8_t {
-  SENSOR_NONE,
-  SENSOR_LUMI,
-  SENSOR_HUMI,
-  SENSOR_TEMP,
-  SENSOR_PRESS,
-  SENSOR_LEVEL,
-  SENSOR_AIRQ,
-  SENSOR_RAIN,
-  TYPE_DIMMER,
-  TYPE_RELAY,
-  SENSOR_TIME,
-  SENSOR_GENERIC,
-  SENSOR_CONTACT
-};
-
-struct Calibration {
-  float min = 0;
-  float max = 100;
-  float correction;
-  uint8_t avail;
-  bool persist;
-  bool pers_state;
-  bool pulse;
-  uint32_t pulse_ms;
-  uint32_t fade;
-  bool state;
-  float value;
-  SensorType type;
-  uint8_t pin;
-  bool inverted;
-  String name;
-  uint8_t id = 0;
-  uint32_t uid = 0;            // wire-protocol identity (index-derived, legacy)
-  uint32_t entity_id = 0;      // stable identity (persisted, NOT index-derived)
-  bool local = true;
-  char device_ip[16];
-  uint32_t device_uid = 0;
-  unsigned long last_update = 0;
-};
+using namespace qymera::model;
 
 struct Fade {
   uint8_t pin;
@@ -78,29 +50,25 @@ enum TimeSource : uint8_t {
   TIME_RTC
 };
 
-extern Calibration calibrations[MAX_SENSORS];
+// Per-slot runtime helper state (index-aligned with the registry).
 extern Fade activeFades[MAX_SENSORS];
 extern PulseState activePulses[MAX_SENSORS];
+
 void init();
 void applyPersistedStates();
 void applyFades();
 void checkPulses();
 // Registers the TIME entity deterministically (before loadCalibration()) so its
-// persisted correction/timezone can be restored. Safe to call before NTP sync.
+// persisted timezone can be restored. Safe to call before NTP sync.
 void ensureTimeRegistered();
-extern int findCalib(const String &key);
-extern int findCalibByUid(uint32_t uid);
-extern int findCalibByIndex(uint8_t index);
-extern int findCalibByEntityId(uint32_t entity_id);
-// Remote-sensor lifecycle: stale remotes are hidden from the active API/UI and
-// their unreferenced slots are reclaimed so MAX_SENSORS cannot be exhausted.
-bool isValidSensorType(uint8_t type);
-bool isStaleRemote(int index);
-bool isEntryVisible(int index);
-void reclaimStaleSlots();
+
+// Local actuator control. `entity_id` is the canonical identity.
 void setRelay(const String &key, bool target);
-void handleDimmer(uint32_t uid, int value);
-void handleToggle(uint32_t uid);
+void handleDimmer(uint32_t entity_id, int value);
+void handleToggle(uint32_t entity_id);
+void handleToggle(const String &key);
+
+// Time
 RTCTime getTime();
 uint16_t getMinutesOfDay();
 uint32_t getUnixTime();
@@ -108,12 +76,10 @@ bool timeValid();
 TimeSource getTimeSource();
 void initNTP();
 void updateNTPTime();
-
-// Time
 void rtc(const RTCTime &time);
 void ntp(const RTCTime &time);
 
-// Sensores
+// Sensores (auto-register when first reported)
 void temperature(const String &key, float raw);
 void humidity(const String &key, int raw);
 void luminosity(const String &key, int raw);
@@ -130,9 +96,9 @@ void dimmer(const String &key, uint8_t pin, bool inverted = false);
 void startFade(const String &key, uint8_t pin, int from, int to, unsigned long dur);
 // Calibración
 float calibrate(const String &key, float raw);
-Calibration *getCalib(const String &key);
+Entity *getCalib(const String &key);
 
-// Net callbacks - Procesadas por sensors.cpp
+// Net callbacks - procesadas por sensors.cpp (operan sobre el registry)
 void onRemoteSensorDiscovered(
   uint32_t remote_uid,
   const char *remote_ip,
@@ -157,7 +123,7 @@ void onRemoteCommand(
   uint32_t value,
   bool state);
 
-// V2 Protocol Callbacks (Phase 3)
+// V2 Protocol Callbacks
 void onV2EntityAnnounce(
   uint32_t remote_uid,
   const char *remote_ip,

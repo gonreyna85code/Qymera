@@ -3,88 +3,38 @@
 #include <time.h>
 #include "config.h"
 #include "model.h"
+#include "entities.h"
 #include "core.h"
 #include "net.h"
 #include "web.h"
+#include "cmd_delivery.h"
 #include "automations.h"
 #include "log.h"
-#include "cmd_delivery.h"
-
 
 namespace sensors {
 
-Calibration calibrations[MAX_SENSORS];
 Fade activeFades[MAX_SENSORS];
 PulseState activePulses[MAX_SENSORS];
 
 static TimeSource time_source = TIME_NONE;
 
-// Simple PRNG for entity ID generation (xorshift32).
-static uint32_t entity_id_seed = 0;
-
-static uint32_t nextEntityId() {
-  if (entity_id_seed == 0) {
-    // Seed from chip ID + millis for variability across boots before persistence loads.
-    entity_id_seed = GET_CHIP_ID() ^ (uint32_t)millis();
-    entity_id_seed |= 1;  // ensure non-zero
-  }
-  // xorshift32
-  uint32_t x = entity_id_seed;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  entity_id_seed = x;
-  // Combine with chip ID upper bits for device-level uniqueness.
-  return (GET_CHIP_ID() & 0xFFFF0000) | (x & 0xFFFF);
-}
-
-static uint32_t makeSensorUid(uint8_t index) {
-  return GET_CHIP_ID() + (uint32_t)index + 1;
-}
-
-static int findFreeCalib() {
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    if (calibrations[i].uid == 0) return i;
-  }
-  return -1;
-}
-
-static void bindLocalSensor(uint8_t idx, const String &name, SensorType type) {
-  auto &c = calibrations[idx];
-  c.id = idx;
-  c.name = name;
-  c.uid = makeSensorUid(idx);
-  c.type = type;
-  c.local = true;
-  c.device_uid = GET_CHIP_ID();
-  IPAddress ip = WiFi.localIP();
-  snprintf(c.device_ip, sizeof(c.device_ip), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-  // Assign stable entity_id on first registration (persisted across reboots).
-  if (c.entity_id == 0) {
-    c.entity_id = nextEntityId();
-    logger::serialf(logger::SENSORS, logger::INFO,
-                    "Entity registered: idx=%d uid=%u entity_id=%08X name=%s",
-                    idx, c.uid, c.entity_id, name.c_str());
-  }
-}
+// ================= REGISTRO =================
 
 // Local-only name lookup for the sensor read/registration functions. A name
 // match against a REMOTE entity must never rebind that entity as local:
-// bindLocalSensor() would then re-announce it under a NEW local uid, which
-// feeds the discovery redistribution loop (remote -> stolen -> re-broadcast
-// -> duplicate). Remote entities are read-only for binding purposes.
-static int findLocalCalib(const String &key) {
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    if (calibrations[i].local && calibrations[i].uid != 0 &&
-        calibrations[i].name == key) return i;
-  }
-  return -1;
+// registerLocal() would then re-announce it as a NEW local entity, feeding
+// the discovery redistribution loop (remote -> stolen -> re-broadcast ->
+// duplicate). Remote entities are read-only for binding purposes.
+static int findLocalIdx(const String &key) {
+  if (key.length() == 0) return -1;
+  return entities::findLocalByName(key.c_str());
 }
 
 void init() {
+  entities::init();
   for (int i = 0; i < MAX_SENSORS; i++) {
-    calibrations[i] = Calibration();
     activeFades[i] = Fade();
+    activePulses[i] = PulseState();
   }
   net::setSensorDiscoveryCallback(onRemoteSensorDiscovered);
   net::setCommandCallback(onRemoteCommand);
@@ -98,84 +48,40 @@ void init() {
 }
 
 void applyPersistedStates() {
+  // Deterministic boot state, applied exactly once before any report:
+  // persistent relays restore their last state; non-persistent relays are OFF.
   for (int i = 0; i < MAX_SENSORS; i++) {
-    auto &c = calibrations[i];
-    if (c.type != TYPE_RELAY) continue;
-    if (!c.local) continue;
-    // Deterministic boot state, applied exactly once before any report:
-    // persistent relays restore their last state; non-persistent relays are OFF.
-    bool on = c.persist ? c.pers_state : false;
-    pinMode(c.pin, OUTPUT);
-    digitalWrite(c.pin, c.inverted ? !on : on);
-    c.state = on;
-    net::setReport(i, c.uid, c.value, c.value, c.state);
+    Entity &c = entities::at((uint8_t)i);
+    if (c.config.type != TYPE_RELAY) continue;
+    if (!c.runtime.local) continue;
+    bool on = c.config.persist ? c.config.pers_state : false;
+    pinMode(c.config.pin, OUTPUT);
+    digitalWrite(c.config.pin, c.config.inverted ? !on : on);
+    c.state.state = on;
   }
 }
 
-// ================= REMOTE SENSOR LIFECYCLE =================
+// ================= REMOTE LIFECYCLE (delegado al registry) =================
 
-bool isValidSensorType(uint8_t type) {
-  // Canonical entity-model definition: a type is valid iff it maps to a real
-  // entity kind (sensor / actuator / clock). Mirrors qymera::model::isValidType.
-  return qymera::model::isValidType(type);
-}
-
-bool isStaleRemote(int index) {
-  if (index < 0 || index >= MAX_SENSORS) return false;
-  auto &c = calibrations[index];
-  if (c.local || c.uid == 0) return false;
-  // Wrap-safe elapsed check (millis() overflow after ~49 days).
-  return (uint32_t)(millis() - c.last_update) > NET_TIMEOUT;
-}
-
-bool isEntryVisible(int index) {
-  if (index < 0 || index >= MAX_SENSORS) return false;
-  auto &c = calibrations[index];
-  if (c.uid == 0) return false;
-  if (!isValidSensorType((uint8_t)c.type)) return false;
-  if (c.local) return true;
-  return !isStaleRemote(index);
-}
-
-void reclaimStaleSlots() {
-  static unsigned long last_pass = 0;
-  // Run at most once per timeout window.
-  if ((uint32_t)(millis() - last_pass) < NET_TIMEOUT) return;
-  last_pass = millis();
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    auto &c = calibrations[i];
-    if (c.local || c.uid == 0) continue;
-    if (!isStaleRemote(i)) continue;
-    // Never reclaim a slot an automation still references: rules address
-    // sensors/actuators by calibration index, so reusing the slot would change
-    // what the rule acts on. Referenced stale entries are kept (hidden) and
-    // stay occupied until the rule is deleted.
-    if (automations::isIndexReferenced((uint8_t)i)) continue;
-    calibrations[i] = Calibration();
-    logger::sensorsf("Reclaimed stale remote slot %d", i);
-  }
-}
+// ================= FADES / PULSES =================
 
 void applyFades() {
   for (int i = 0; i < MAX_SENSORS; i++) {
     if (!activeFades[i].active) continue;
     auto &f = activeFades[i];
-    auto &c = calibrations[i];
-    if (!c.local) continue;
+    const Entity &c = entities::peek((uint8_t)i);
+    if (!c.runtime.local) continue;
     unsigned long elapsed = millis() - f.startTime;
     if (elapsed >= f.duration) {
       int pwm = f.endVal;
-      if (c.inverted)
-        pwm = PWM_MAX_OUT - pwm;
+      if (c.config.inverted) pwm = PWM_MAX_OUT - pwm;
       pwmWritePin(f.pin, (uint8_t)pwm);
       f.active = false;
     } else {
       float progress = (float)elapsed / f.duration;
-      int current =
-        f.startVal + (f.endVal - f.startVal) * progress;
+      int current = f.startVal + (int)((f.endVal - f.startVal) * progress);
       int pwm = current;
-      if (c.inverted)
-        pwm = PWM_MAX_OUT - pwm;
+      if (c.config.inverted) pwm = PWM_MAX_OUT - pwm;
       pwmWritePin(f.pin, (uint8_t)pwm);
     }
   }
@@ -189,197 +95,152 @@ void checkPulses() {
       digitalWrite(activePulses[i].pin,
         (false ^ activePulses[i].inverted) ? HIGH : LOW);
       activePulses[i].active = false;
-      // Sincronizar estado lógico y reportar
-      auto &c = calibrations[i];
-      c.state = false;
-      if (c.persist && c.pers_state != c.state) {
-        c.pers_state = c.state;
+      // Sincronizar estado lógico
+      Entity &c = entities::at((uint8_t)i);
+      c.state.state = false;
+      if (c.config.persist && c.config.pers_state != c.state.state) {
+        c.config.pers_state = c.state.state;
         web::saveCalibrationSlot(i);
       }
-      logger::sensorsf("Relay %s -> OFF", c.name.c_str());
-      net::setReport(i, c.uid, c.value, c.value, c.state);
+      logger::sensorsf("Relay %s -> OFF", c.config.name);
     }
   }
 }
 
-int findCalib(const String &key) {
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    if (calibrations[i].name == key) return i;
-  }
-  return -1;
-}
+// ================= ACTUADORES =================
 
-int findCalibByUid(uint32_t uid) {
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    if (calibrations[i].uid == uid) return i;
-  }
-  return -1;
-}
+// Core relay driver. Handles local GPIO/pulse/persistence and remote
+// delivery (V2 reliable for entity-keyed remotes, legacy otherwise).
+static void setRelayByIndex(int idx, bool target) {
+  Entity &c = entities::at((uint8_t)idx);
 
-int findCalibByIndex(uint8_t index) {
-  if (index >= MAX_SENSORS) return -1;
-  return calibrations[index].uid == 0 ? -1 : index;
-}
-
-int findCalibByEntityId(uint32_t entity_id) {
-  if (entity_id == 0) return -1;
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    if (calibrations[i].entity_id == entity_id) return i;
-  }
-  return -1;
-}
-
-void setRelay(const String &key, bool target) {
-  int idx = findCalib(key);
-  if (idx < 0) return;
-  auto &c = calibrations[idx];
-  if (c.type != TYPE_RELAY) return;
-
-  if (!c.local) {
+  if (!c.runtime.local) {
     // ---- Actuador REMOTO: ----
-    // V2-discovered remotes (stable entity_id) get reliable delivery (ACK +
-    // retry + timeout). Legacy-only remotes keep the best-effort legacy path.
-    if (c.entity_id != 0) {
+    if (c.identity.entity_id != 0) {
       net::sendReliableV2Command(
-        c.device_uid, c.device_ip, c.entity_id,
+        c.identity.device_id, c.runtime.device_ip, c.identity.entity_id,
         (uint8_t)TYPE_RELAY, target ? 1u : 0u, target);
     } else {
       net::sendCommand(
-        c.device_uid, c.device_ip, c.uid,
+        c.identity.device_id, c.runtime.device_ip, c.identity.entity_id,
         (uint8_t)TYPE_RELAY, target ? 1u : 0u, target);
     }
     return;
   }
 
   // ---- Actuador LOCAL: operar GPIO ----
-  if (c.pulse) {
+  if (c.config.pulse) {
     if (target) {
-      // ---- Activar modo pulse ----
-      digitalWrite(c.pin, (true  ^ c.inverted) ? HIGH : LOW);
-      activePulses[idx].pin = c.pin;
-      activePulses[idx].inverted = c.inverted;
+      digitalWrite(c.config.pin, (true ^ c.config.inverted) ? HIGH : LOW);
+      activePulses[idx].pin = c.config.pin;
+      activePulses[idx].inverted = c.config.inverted;
       activePulses[idx].start_ms = millis();
-      activePulses[idx].pulse_ms = c.pulse_ms;
+      activePulses[idx].pulse_ms = c.config.pulse_ms;
       activePulses[idx].active = true;
-      c.state = true;  // Relay IS ON while pulse is active
+      c.state.state = true;  // Relay IS ON while pulse is active
     } else {
-      // ---- Desactivar modo pulse (apagar relay y detener timer) ----
-      activePulses[idx].active = false;  // Detener timer de pulse
-      digitalWrite(c.pin, (false ^ c.inverted) ? HIGH : LOW);
-      c.state = false;
+      activePulses[idx].active = false;
+      digitalWrite(c.config.pin, (false ^ c.config.inverted) ? HIGH : LOW);
+      c.state.state = false;
     }
   } else {
-    // Normal ON/OFF mode (sin pulse)
-    if (target) {
-      digitalWrite(c.pin, (true ^ c.inverted) ? HIGH : LOW);
-    } else {
-      digitalWrite(c.pin, (false ^ c.inverted) ? HIGH : LOW);
-    }
-    c.state = target;
+    digitalWrite(c.config.pin, (target ^ c.config.inverted) ? HIGH : LOW);
+    c.state.state = target;
   }
 
   // ---- Persistencia en EEPROM (solo si cambió el estado) ----
-  if (c.persist && c.pers_state != c.state) {
-    c.pers_state = c.state;
+  if (c.config.persist && c.config.pers_state != c.state.state) {
+    c.config.pers_state = c.state.state;
     web::saveCalibrationSlot(idx);
   }
 
-  logger::sensorsf("Relay %s -> %s", c.name.c_str(), target ? "ON" : "OFF");
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
+  c.state.last_update = millis();
+  logger::sensorsf("Relay %s -> %s", c.config.name, target ? "ON" : "OFF");
 }
 
-void handleDimmer(const String &key, int value) {
-  int idx = findCalib(key);
+void setRelay(const String &key, bool target) {
+  int idx = entities::findLocalByName(key.c_str());
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  if (c.type != TYPE_DIMMER) return;
+  if (entities::at((uint8_t)idx).config.type != TYPE_RELAY) return;
+  setRelayByIndex(idx, target);
+}
+
+// Core dimmer driver. Local PWM/fade + remote delivery.
+static void dimmerByIndex(int idx, int value) {
+  Entity &c = entities::at((uint8_t)idx);
   value = constrain(value, 0, 100);
 
-  if (!c.local) {
-    // ---- Actuador REMOTO: ----
-    // V2-discovered remotes get reliable delivery; legacy-only keep the
-    // best-effort legacy path.
-    if (c.entity_id != 0) {
+  if (!c.runtime.local) {
+    if (c.identity.entity_id != 0) {
       net::sendReliableV2Command(
-        c.device_uid, c.device_ip, c.entity_id,
+        c.identity.device_id, c.runtime.device_ip, c.identity.entity_id,
         (uint8_t)TYPE_DIMMER, (uint32_t)value, value > 0);
     } else {
       net::sendCommand(
-        c.device_uid, c.device_ip, c.uid,
+        c.identity.device_id, c.runtime.device_ip, c.identity.entity_id,
         (uint8_t)TYPE_DIMMER, (uint32_t)value, value > 0);
     }
     return;
   }
 
-  // ---- Actuador LOCAL: operar PWM ----
   int pwm_val = map(value, 0, 100, 0, PWM_MAX_OUT);
-  if (c.inverted)
-    pwm_val = PWM_MAX_OUT - pwm_val;
-  if (c.fade > 0) {
-    int current = pwmReadPin(c.pin);
-    startFade(key, c.pin, current, pwm_val, c.fade);
+  if (c.config.inverted) pwm_val = PWM_MAX_OUT - pwm_val;
+  if (c.config.fade > 0) {
+    int current = pwmReadPin(c.config.pin);
+    startFade(c.config.name, c.config.pin, current, pwm_val, c.config.fade);
   } else {
-    pwmWritePin(c.pin, (uint8_t)pwm_val);
+    pwmWritePin(c.config.pin, (uint8_t)pwm_val);
   }
-  c.value = value;
-  c.state = (value > 0);
-  logger::sensorsf("Dimmer %s -> %d%%", c.name.c_str(), value);
-  net::setReport(idx, c.uid, c.value, c.state ? c.value : 0, c.state);
+  c.state.value = value;
+  c.state.state = (value > 0);
+  c.state.last_update = millis();
+  logger::sensorsf("Dimmer %s -> %d%%", c.config.name, value);
 }
 
-void handleToggle(uint32_t uid) {
-  int idx = findCalibByUid(uid);
+void handleDimmer(const String &key, int value) {
+  int idx = entities::findLocalByName(key.c_str());
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  if (c.type == TYPE_RELAY) {
-    // Cuando se hace toggle, enviar el estado contrario
-    // Si pulse está activo, esto lo desactivará
-    // Si pulse no está activo, toggla ON/OFF normal
-    setRelay(c.name, !c.state);
-    // Forzar re-carga de dispositivos después
-    // (esto provocará que loadDevices() lea el nuevo c.state)
-  } else if (c.type == TYPE_DIMMER) {
-    c.state = !c.state;
-    int pwm_val = map(c.value, 0, 100, 0, PWM_MAX_OUT);
-    if (c.inverted)
-      pwm_val = PWM_MAX_OUT - pwm_val;
-    if (c.fade > 0) {
-      int current = pwmReadPin(c.pin);
-      startFade(
-        c.name,
-        c.pin,
-        current,
-        c.state ? pwm_val : 0,
-        c.fade);
+  if (entities::at((uint8_t)idx).config.type != TYPE_DIMMER) return;
+  dimmerByIndex(idx, value);
+}
+
+void handleDimmer(uint32_t entity_id, int value) {
+  int idx = entities::findById(entity_id);
+  if (idx < 0) return;
+  if (entities::at((uint8_t)idx).config.type != TYPE_DIMMER) return;
+  dimmerByIndex(idx, value);
+}
+
+void handleToggle(uint32_t entity_id) {
+  int idx = entities::findById(entity_id);
+  if (idx < 0) return;
+  Entity &c = entities::at((uint8_t)idx);
+  if (c.config.type == TYPE_RELAY) {
+    setRelayByIndex(idx, !c.state.state);
+  } else if (c.config.type == TYPE_DIMMER) {
+    bool on = !c.state.state;
+    int pwm_val = map((int)c.state.value, 0, 100, 0, PWM_MAX_OUT);
+    if (c.config.inverted) pwm_val = PWM_MAX_OUT - pwm_val;
+    if (c.config.fade > 0) {
+      int current = pwmReadPin(c.config.pin);
+      startFade(c.config.name, c.config.pin, current, on ? pwm_val : 0, c.config.fade);
     } else {
-      pwmWritePin(
-        c.pin,
-        (uint8_t)(c.state ? pwm_val : 0));
+      pwmWritePin(c.config.pin, (uint8_t)(on ? pwm_val : 0));
     }
-    logger::sensorsf("Dimmer %s -> %s", c.name.c_str(), c.state ? "ON" : "OFF");
-    net::setReport(
-      idx,
-      c.uid,
-      c.value,
-      c.state ? c.value : 0,
-      c.state);
+    c.state.state = on;
+    c.state.last_update = millis();
+    logger::sensorsf("Dimmer %s -> %s", c.config.name, on ? "ON" : "OFF");
   }
-}
-
-void handleDimmer(uint32_t uid, int value) {
-  int idx = findCalibByUid(uid);
-  if (idx < 0) return;
-  handleDimmer(calibrations[idx].name, value);
 }
 
 void handleToggle(const String &key) {
-  int idx = findCalib(key);
+  int idx = entities::findLocalByName(key.c_str());
   if (idx < 0) return;
-  handleToggle(calibrations[idx].uid);
+  handleToggle(entities::at((uint8_t)idx).identity.entity_id);
 }
 
 void startFade(const String &key, uint8_t pin, int from, int to, unsigned long dur) {
-  int idx = findCalib(key);
+  int idx = entities::findLocalByName(key.c_str());
   if (idx < 0) return;
   activeFades[idx].pin = pin;
   activeFades[idx].startVal = from;
@@ -389,204 +250,219 @@ void startFade(const String &key, uint8_t pin, int from, int to, unsigned long d
   activeFades[idx].active = true;
 }
 
+// ================= SENSORES (AUTO-REGISTRO) =================
+
+// Register-if-needed and return a mutable local entity reference.
+static Entity &ensureLocalEntity(const String &key, uint8_t type, int *out_idx) {
+  int idx = entities::findLocalByName(key.c_str());
+  if (idx < 0) idx = entities::registerLocal(key.c_str(), type);
+  if (out_idx) *out_idx = idx;
+  static Entity dummy;
+  if (idx < 0) {
+    dummy = Entity();
+    dummy.runtime.local = true;
+    dummy.runtime.online = true;
+    return dummy;  // registry full: drop (mirrors old behavior)
+  }
+  return entities::at((uint8_t)idx);
+}
+
 void temperature(const String &key, float raw) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_TEMP, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_TEMP);
-  c.value = calibrate(key, raw);
-  net::setReport(idx, c.uid, c.value, raw, c.state);
+  c.state.value = calibrate(key, raw);
+  c.state.raw = raw;
+  c.state.last_update = millis();
 }
 
 void humidity(const String &key, int raw) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_HUMI, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_HUMI);
-  c.value = calibrate(key, raw);
-  net::setReport(idx, c.uid, c.value, raw, c.state);
+  c.state.value = calibrate(key, raw);
+  c.state.raw = (float)raw;
+  c.state.last_update = millis();
 }
 
 void luminosity(const String &key, int raw) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_LUMI, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_LUMI);
-  c.value = calibrate(key, raw);
-  net::setReport(idx, c.uid, c.value, raw, c.state);
+  c.state.value = calibrate(key, raw);
+  c.state.raw = (float)raw;
+  c.state.last_update = millis();
 }
 
 void level(const String &key, int raw) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_LEVEL, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_LEVEL);
-  c.value = calibrate(key, raw);
-  net::setReport(idx, c.uid, c.value, raw, c.state);
+  c.state.value = calibrate(key, raw);
+  c.state.raw = (float)raw;
+  c.state.last_update = millis();
 }
 
 void pressure(const String &key, float raw) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_PRESS, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_PRESS);
-  c.value = calibrate(key, raw);
-  net::setReport(idx, c.uid, c.value, raw, c.state);
+  c.state.value = calibrate(key, raw);
+  c.state.raw = raw;
+  c.state.last_update = millis();
 }
 
 void airQ(const String &key, const int &v) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_AIRQ, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_AIRQ);
-  c.value = v;
-  net::setReport(idx, c.uid, c.value, v, c.state);
+  c.state.value = (float)v;
+  c.state.raw = (float)v;
+  c.state.last_update = millis();
 }
 
 void rain(const String &key, bool v) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_RAIN, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_RAIN);
-  c.state = v;
-  c.value = v ? 1.0f : 0.0f;
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
+  c.state.state = v;
+  c.state.value = v ? 1.0f : 0.0f;
+  c.state.raw = c.state.value;
+  c.state.last_update = millis();
 }
 
 void custom(const String &key, float raw) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_GENERIC, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_GENERIC);
-  c.value = calibrate(key, raw);
-  net::setReport(idx, c.uid, c.value, raw, c.state);
+  c.state.value = calibrate(key, raw);
+  c.state.raw = raw;
+  c.state.last_update = millis();
 }
 
 void contact(const String &key, bool v) {
-  int idx = findLocalCalib(key);
-  if (idx < 0) idx = findFreeCalib();
+  int idx = -1;
+  Entity &c = ensureLocalEntity(key, SENSOR_CONTACT, &idx);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  bindLocalSensor(idx, key, SENSOR_CONTACT);
-  c.state = v;
-  c.value = v ? 0.0f : 1.0f;
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
+  c.state.state = v;
+  c.state.value = v ? 0.0f : 1.0f;
+  c.state.raw = c.state.value;
+  c.state.last_update = millis();
+}
+
+// Local actuator registration. `type` is authoritative for the entity kind;
+// binding runs once and never rebinds a remote entity as local.
+static bool bindLocalActuator(const String &key, uint8_t type) {
+  int idx = entities::registerLocal(key.c_str(), type);
+  if (idx < 0) return false;
+  Entity &c = entities::at((uint8_t)idx);
+  c.runtime.local = true;
+  c.runtime.online = true;
+  // Keep an already-restored entity_id (persistence); only assign when empty.
+  if (c.identity.entity_id == ENTITY_ID_NONE) {
+    c.identity.entity_id = entities::nextEntityId();
+  }
+  return true;
 }
 
 void relay(const String &key, uint8_t pin, bool inverted) {
-  int idx = findCalib(key);
+  int idx = entities::findLocalByName(key.c_str());
   bool is_new = (idx < 0);
   if (is_new) {
-    idx = findFreeCalib();
+    if (!bindLocalActuator(key, TYPE_RELAY)) return;
+    idx = entities::findLocalByName(key.c_str());
     if (idx < 0) return;
   }
-  auto &c = calibrations[idx];
+  Entity &c = entities::at((uint8_t)idx);
+  c.config.pin = pin;
+  c.config.inverted = inverted;
   if (is_new) {
-    Serial.printf(
-      "REGISTER idx=%d name=%s persist=%d pers=%d\n",
-      idx,
-      c.name.c_str(),
-      c.persist,
-      c.pers_state);
-    bindLocalSensor(idx, key, TYPE_RELAY);
-    c.pin = pin;
-    c.inverted = inverted;
     // Only configure the pin here. The initial GPIO state is applied once in
     // applyPersistedStates() (before the first report) to avoid an
     // OFF -> ON glitch on persistent relays at boot.
     pinMode(pin, OUTPUT);
   }
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void dimmer(const String &key, uint8_t pin, bool inverted) {
-  int idx = findCalib(key);
+  int idx = entities::findLocalByName(key.c_str());
   bool is_new = (idx < 0);
   if (is_new) {
-    idx = findFreeCalib();
+    if (!bindLocalActuator(key, TYPE_DIMMER)) return;
+    idx = entities::findLocalByName(key.c_str());
     if (idx < 0) return;
   }
-  auto &c = calibrations[idx];
+  Entity &c = entities::at((uint8_t)idx);
+  c.config.pin = pin;
+  c.config.inverted = inverted;
   if (is_new) {
-    bindLocalSensor(idx, key, TYPE_DIMMER);
-    c.pin = pin;
-    c.inverted = inverted;
     pwmSetup(pin);
     int off_pwm = 0;
-    if (c.inverted)
-      off_pwm = PWM_MAX_OUT;
+    if (c.config.inverted) off_pwm = PWM_MAX_OUT;
     pwmWritePin(pin, (uint8_t)off_pwm);
   }
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void ensureTimeRegistered() {
-  int idx = findCalib("TIME");
+  int idx = entities::findLocalByName("TIME");
   if (idx >= 0) return;
-  idx = findFreeCalib();
+  idx = entities::registerLocal("TIME", SENSOR_TIME);
   if (idx < 0) return;
-  bindLocalSensor(idx, "TIME", SENSOR_TIME);
-  calibrations[idx].state = true;
+  entities::at((uint8_t)idx).state.state = true;
 }
 
 static void updateTimeSensor() {
   time_t now = time(nullptr);
   if (now < 1704067200) return;
-  int idx = findCalib("TIME");
+  int idx = entities::findLocalByName("TIME");
   if (idx < 0) {
-    idx = findFreeCalib();
+    idx = entities::registerLocal("TIME", SENSOR_TIME);
     if (idx < 0) return;
-    bindLocalSensor(idx, "TIME", SENSOR_TIME);
-    calibrations[idx].state = true;
+    entities::at((uint8_t)idx).state.state = true;
   }
-  auto &c = calibrations[idx];
-  c.value = (float)now;
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
+  Entity &c = entities::at((uint8_t)idx);
+  c.state.value = (float)now;
+  c.state.last_update = millis();
 }
+
+// ================= CALIBRACIÓN =================
 
 float calibrate(const String &key, float raw) {
-  Calibration *c = getCalib(key);
-  if (!c) return raw;
-  float v = raw + c->correction;
-  if (c->type == SENSOR_LUMI) return v;
-  if (c->type == SENSOR_TEMP) return v;
-  if (c->type == SENSOR_GENERIC) return v;
-  if (c->type == SENSOR_PRESS) return v;
-  if (c->max <= c->min) return v;
-  if (c->type == SENSOR_HUMI || c->type == SENSOR_LEVEL) {
-    float span = c->max - c->min;
+  Entity *e = getCalib(key);
+  if (!e) return raw;
+  const EntityConfig &cfg = e->config;
+  float v = raw + cfg.correction;
+  if (cfg.type == SENSOR_LUMI) return v;
+  if (cfg.type == SENSOR_TEMP) return v;
+  if (cfg.type == SENSOR_GENERIC) return v;
+  if (cfg.type == SENSOR_PRESS) return v;
+  if (cfg.max <= cfg.min) return v;
+  if (cfg.type == SENSOR_HUMI || cfg.type == SENSOR_LEVEL) {
+    float span = cfg.max - cfg.min;
     if (span <= 0.001f) return v;
-    return constrain((v - c->min) / span * 100.0f, 0.0f, 100.0f);
+    return constrain((v - cfg.min) / span * 100.0f, 0.0f, 100.0f);
   }
-  return constrain(v, c->min, c->max);
+  return constrain(v, cfg.min, cfg.max);
 }
 
-Calibration *getCalib(const String &key) {
-  int idx = findCalib(key);
-  return (idx >= 0) ? &calibrations[idx] : nullptr;
+Entity *getCalib(const String &key) {
+  int idx = entities::findLocalByName(key.c_str());
+  return (idx >= 0) ? &entities::at((uint8_t)idx) : nullptr;
 }
 
 // ========================================
 // TIMEZONE
 // ========================================
-// The SENSOR_TIME calibration's `correction` field IS the timezone offset in
+// The SENSOR_TIME entity's `correction` field IS the timezone offset in
 // minutes from UTC (persisted). The runtime clock itself always stays UTC:
 // NTP syncs UTC and time() is never shifted. UTC -> local is an explicit,
 // portable conversion (epoch + offset_minutes*60 decomposed with gmtime()),
 // avoiding libc timezone globals (configTime TZ / setenv TZ) whose semantics
 // differ between ESP8266 (newlib) and ESP32 (lwip) and would break parity.
 static int32_t timezoneOffsetMinutes() {
-  int idx = findCalib("TIME");
+  int idx = entities::findLocalByName("TIME");
   if (idx < 0) return 0;
-  return (int32_t)calibrations[idx].correction;
+  return (int32_t)entities::at((uint8_t)idx).config.correction;
 }
 
 static time_t toLocalEpoch(time_t utc) {
@@ -641,15 +517,12 @@ void initNTP() {
 }
 
 void updateNTPTime() {
-  if (getTimeSource() == TIME_RTC)
-    return;
+  if (getTimeSource() == TIME_RTC) return;
   time_t now = time(nullptr);
-  if (now < 1704067200)
-    return;
+  if (now < 1704067200) return;
   time_t local = toLocalEpoch(now);
   struct tm *timeinfo = gmtime(&local);
-  if (!timeinfo)
-    return;
+  if (!timeinfo) return;
   RTCTime ntpTime = {
     static_cast<uint16_t>(timeinfo->tm_year + 1900),
     static_cast<uint8_t>(timeinfo->tm_mon + 1),
@@ -666,36 +539,26 @@ void updateNTPTime() {
 // CALLBACK DE COMANDOS REMOTOS
 // ========================================
 
-/**
- * @brief Invocada por net::tick() cuando llega un paquete dirigido a este
- *        dispositivo (is_remote == false).  Busca el actuador por su uid y
- *        delega en setRelay / handleDimmer para ejecutar la acción LOCAL.
- *
- * @param command_type  Tipo de sensor/actuador del paquete (TYPE_RELAY, etc.).
- * @param sensor_id     UID del actuador destino.
- * @param value         Valor asociado (nivel dimmer o flag relay).
- * @param state         Estado ON/OFF.
- */
+// Only READ_WRITE entities (relay / dimmer) are commandable.
+static bool isCommandableType(uint8_t type) {
+  return qymera::model::capabilityOfType(type) == EntityCapability::READ_WRITE;
+}
+
 void onRemoteCommand(
   uint8_t command_type,
   uint32_t sensor_id,
   uint32_t value,
   bool state) {
-  int idx = findCalibByUid(sensor_id);
+  int idx = entities::findById(sensor_id);
   if (idx < 0) return;
-  auto &c = calibrations[idx];
-  if (!c.local) return;  // sólo actuamos sobre sensores propios
-
-  // Only READ_WRITE entities (actuators: relay / dimmer) are commandable.
-  if (qymera::model::capabilityOfType(command_type) !=
-      qymera::model::EntityCapability::READ_WRITE) {
-    return;
-  }
+  Entity &c = entities::at((uint8_t)idx);
+  if (!c.runtime.local) return;  // sólo actuamos sobre entidades propias
+  if (!isCommandableType(command_type)) return;
 
   if (command_type == (uint8_t)TYPE_RELAY) {
-    setRelay(c.name, state);
+    setRelayByIndex(idx, state);
   } else if (command_type == (uint8_t)TYPE_DIMMER) {
-    handleDimmer(c.name, (int)value);
+    dimmerByIndex(idx, (int)value);
   }
 }
 
@@ -721,11 +584,11 @@ void onRemoteSensorDiscovered(
   bool sensor_pulse,
   uint32_t sensor_pulse_ms) {
   if (sensor_type == SENSOR_TIME) {
-    int idx = findCalib("TIME");
+    int idx = entities::findLocalByName("TIME");
     if (idx < 0) return;
-    auto &c = calibrations[idx];
-    if (c.correction == 0 && sensor_correction != 0) {
-      c.correction = sensor_correction;
+    Entity &c = entities::at((uint8_t)idx);
+    if (c.config.correction == 0 && sensor_correction != 0) {
+      c.config.correction = sensor_correction;
       web::saveCalibrationSlot(idx);
     }
     if (!timeValid() && sensor_value > 1704067200) {
@@ -737,149 +600,141 @@ void onRemoteSensorDiscovered(
     }
     return;
   }
-  int idx = -1;
-  for (int i = 0; i < MAX_SENSORS; i++) {
-    if (!calibrations[i].local && calibrations[i].device_uid == remote_uid && calibrations[i].uid == sensor_id) {
-      idx = i;
-      break;
-    }
-  }
+
+  // Find-or-create the remote entity keyed by (device_id, entity_id).
+  int idx = entities::findRemoteByPeer(remote_uid, sensor_id);
   bool is_new = false;
-  if (idx == -1) {
-    for (int i = 0; i < MAX_SENSORS; i++) {
-      if (calibrations[i].uid == 0) {
-        idx = i;
-        is_new = true;
-        break;
-      }
-    }
+  if (idx < 0) {
+    idx = entities::findFree();
+    is_new = (idx >= 0);
   }
   if (idx < 0) {
     // No free slot for a new remote entity; it is dropped. Slots are reclaimed
-    // by reclaimStaleSlots() once the owning device stops announcing it.
+    // by entities::reclaimStale() once the owning device stops announcing it.
     return;
   }
-  auto &c = calibrations[idx];
-  c.local = false;
-  c.device_uid = remote_uid;
-  strncpy(c.device_ip, remote_ip, sizeof(c.device_ip) - 1);
-  c.device_ip[sizeof(c.device_ip) - 1] = '\0';
-  c.id = idx;
-  c.uid = sensor_id;
-  c.type = (SensorType)sensor_type;
-  if (is_new) c.avail = 0;
-  c.state = sensor_state;
-  c.last_update = millis();
+  Entity &c = entities::at((uint8_t)idx);
+  if (is_new) {
+    c = Entity();
+    c.runtime.local = false;
+    c.identity.device_id = remote_uid;
+    c.identity.entity_id = sensor_id;
+    c.state.avail = 0;
+  }
+  strncpy(c.runtime.device_ip, remote_ip, ENTITY_IP_LEN - 1);
+  c.runtime.device_ip[ENTITY_IP_LEN - 1] = '\0';
+  c.config.type = sensor_type;
+  c.state.state = sensor_state;
+  c.state.last_update = millis();
+  c.runtime.last_seen = c.state.last_update;
+  c.runtime.online = true;
   // Mirror the owner's persistence/actuator config so the local GUI shows the
   // real remote values (fade, persist, pers_state, pulse, pulse_ms).
-  c.fade = sensor_fade;
-  c.persist = sensor_persist;
-  c.pers_state = sensor_pers_state;
-  c.pulse = sensor_pulse;
-  c.pulse_ms = sensor_pulse_ms;
-  if (c.type == SENSOR_LUMI) {
-    c.value = (uint32_t)sensor_value;
+  c.config.fade = sensor_fade;
+  c.config.persist = sensor_persist;
+  c.config.pers_state = sensor_pers_state;
+  c.config.pulse = sensor_pulse;
+  c.config.pulse_ms = sensor_pulse_ms;
+  c.config.min = sensor_min;
+  c.config.max = sensor_max;
+  c.config.correction = sensor_correction;
+  if (c.config.type == SENSOR_LUMI) {
+    c.state.value = (uint32_t)sensor_value;
   } else {
     float normalized = (float)sensor_value / 0xFFFFFFFF;
-    c.value = normalized * (150.0f - (-50.0f)) + (-50.0f);
+    c.state.value = normalized * (net::MAX_VAL - net::MIN_VAL) + net::MIN_VAL;
   }
   if (sensor_name.length()) {
-    c.name = sensor_name;
-  } else if (c.name == "") {
+    strncpy(c.config.name, sensor_name.c_str(), ENTITY_NAME_LEN - 1);
+  } else if (c.config.name[0] == '\0') {
     char namebuf[32];
     snprintf(namebuf, sizeof(namebuf), "Remote_%X_%u", remote_uid, sensor_id);
-    c.name = namebuf;
+    strncpy(c.config.name, namebuf, ENTITY_NAME_LEN - 1);
   }
   if (is_new) {
-    logger::sensorsf("New remote sensor '%s' (type:%d, uid:%u)", c.name.c_str(), sensor_type, sensor_id);
+    logger::sensorsf("New remote sensor '%s' (type:%d, entity_id:%u)",
+                     c.config.name, sensor_type, sensor_id);
   }
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 // ========================================
-// PROTOCOL V2 CALLBACKS (Phase 3)
+// PROTOCOL V2 CALLBACKS
 // ========================================
 
 void onV2EntityAnnounce(
   uint32_t remote_uid,
   const char *remote_ip,
   const qymera::protocol::v2::EntityAnnouncePayload &payload) {
-  using namespace qymera::protocol::v2;
-  // Match by stable entity_id first
-  int idx = findCalibByEntityId(payload.entity_id);
+  // Match by stable (device_id, entity_id) pair first.
+  int idx = entities::findRemoteByPeer(remote_uid, payload.entity_id);
+  bool is_new = false;
   if (idx < 0) {
-    // Not found by entity_id; try legacy uid + device_uid match
-    for (int i = 0; i < MAX_SENSORS; i++) {
-      if (!calibrations[i].local && calibrations[i].device_uid == remote_uid &&
-          calibrations[i].uid == payload.entity_id) {  // legacy: entity_id == uid in v2
-        idx = i;
-        break;
-      }
+    int by_id = entities::findById(payload.entity_id);
+    if (by_id >= 0 && !entities::at((uint8_t)by_id).runtime.local) {
+      idx = by_id;
     }
   }
-  bool is_new = false;
-  if (idx == -1) {
-    for (int i = 0; i < MAX_SENSORS; i++) {
-      if (calibrations[i].uid == 0) {
-        idx = i;
-        is_new = true;
-        break;
-      }
-    }
+  if (idx < 0) {
+    idx = entities::findFree();
+    is_new = (idx >= 0);
   }
   if (idx < 0) return;  // no free slot
 
-  auto &c = calibrations[idx];
-  c.local = false;
-  c.device_uid = remote_uid;
-  strncpy(c.device_ip, remote_ip, sizeof(c.device_ip) - 1);
-  c.device_ip[sizeof(c.device_ip) - 1] = '\0';
-  c.id = idx;
-  c.uid = payload.entity_id;  // V2: entity_id on wire
-  c.entity_id = payload.entity_id;
-  c.type = (SensorType)payload.type;
-  if (is_new) c.avail = 0;
-  c.state = (payload.capabilities & (uint8_t)qymera::model::EntityCapability::WRITE) ? false : true;  // actuator default OFF
-  c.last_update = millis();
-  c.fade = payload.fade;
-  c.persist = payload.persist;
-  c.pers_state = payload.pers_state;
-  c.pulse = payload.pulse;
-  c.pulse_ms = payload.pulse_ms;
-  c.min = payload.min;
-  c.max = payload.max;
-  c.correction = payload.correction;
-  c.avail = payload.avail;
+  Entity &c = entities::at((uint8_t)idx);
+  if (is_new) {
+    c = Entity();
+    c.runtime.local = false;
+    c.identity.device_id = remote_uid;
+    c.identity.entity_id = payload.entity_id;
+    c.state.avail = 0;
+    // Actuators start in a known state (OFF); measurements default to ONLINE.
+    c.state.state = (payload.capabilities & (uint8_t)EntityCapability::WRITE)
+                      ? false : true;
+  }
+  strncpy(c.runtime.device_ip, remote_ip, ENTITY_IP_LEN - 1);
+  c.runtime.device_ip[ENTITY_IP_LEN - 1] = '\0';
+  c.config.type = payload.type;
+  c.state.last_update = millis();
+  c.runtime.last_seen = c.state.last_update;
+  c.runtime.online = true;
+  c.config.fade = payload.fade;
+  c.config.persist = payload.persist;
+  c.config.pers_state = payload.pers_state;
+  c.config.pulse = payload.pulse;
+  c.config.pulse_ms = payload.pulse_ms;
+  c.config.min = payload.min;
+  c.config.max = payload.max;
+  c.config.correction = payload.correction;
+  c.state.avail = payload.avail;
   if (payload.name[0]) {
-    c.name = payload.name;
-  } else if (c.name == "") {
+    strncpy(c.config.name, payload.name, ENTITY_NAME_LEN - 1);
+  } else if (c.config.name[0] == '\0') {
     char namebuf[32];
     snprintf(namebuf, sizeof(namebuf), "Remote_%X_%u", remote_uid, payload.entity_id);
-    c.name = namebuf;
+    strncpy(c.config.name, namebuf, ENTITY_NAME_LEN - 1);
   }
   if (is_new) {
     logger::sensorsf("V2 New remote entity '%s' (type:%d, entity_id:%08X)",
-                     c.name.c_str(), payload.type, payload.entity_id);
+                     c.config.name, payload.type, payload.entity_id);
   }
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
 }
 
 void onV2StateUpdate(
   uint32_t remote_uid,
   const qymera::protocol::v2::StateUpdatePayload &payload) {
-  int idx = findCalibByEntityId(payload.entity_id);
+  int idx = entities::findById(payload.entity_id);
   if (idx < 0) return;  // unknown entity
-  auto &c = calibrations[idx];
-  if (c.local) return;  // only update remotes
-  if (c.device_uid != remote_uid) return;  // not our device
+  Entity &c = entities::at((uint8_t)idx);
+  if (c.runtime.local) return;  // only update remotes
+  if (c.identity.device_id != remote_uid) return;  // not our device
 
-  c.state = payload.state;
-  c.value = (c.type == sensors::SENSOR_LUMI || c.type == sensors::SENSOR_TIME)
-              ? (float)payload.value
-              : ((float)payload.value / 0xFFFFFFFF) * (150.0f - (-50.0f)) + (-50.0f);
-  c.avail = payload.avail;
-  c.last_update = millis();
-  net::setReport(idx, c.uid, c.value, c.value, c.state);
+  c.state.state = payload.state;
+  c.state.value = (c.config.type == SENSOR_LUMI || c.config.type == SENSOR_TIME)
+                    ? (float)payload.value
+                    : ((float)payload.value / 0xFFFFFFFF) * (net::MAX_VAL - net::MIN_VAL) + net::MIN_VAL;
+  c.state.avail = payload.avail;
+  c.state.last_update = millis();
+  c.runtime.last_seen = c.state.last_update;
 }
 
 uint8_t onV2Command(
@@ -889,21 +744,17 @@ uint8_t onV2Command(
   const qymera::protocol::v2::CommandPayload &payload) {
   // Find local actuator by entity_id. The transport layer sends the
   // COMMAND_ACK / COMMAND_ERROR using the returned status.
-  int idx = findCalibByEntityId(payload.entity_id);
+  int idx = entities::findById(payload.entity_id);
   if (idx < 0) return qymera::delivery::ST_NOT_FOUND;
-  auto &c = calibrations[idx];
-  if (!c.local) return qymera::delivery::ST_NOT_LOCAL;
+  Entity &c = entities::at((uint8_t)idx);
+  if (!c.runtime.local) return qymera::delivery::ST_NOT_LOCAL;
   // Only actuators (READ_WRITE) are commandable.
-  if (qymera::model::capabilityOfType(payload.type) !=
-      qymera::model::EntityCapability::READ_WRITE) {
-    return qymera::delivery::ST_INVALID;
-  }
+  if (!isCommandableType(payload.type)) return qymera::delivery::ST_INVALID;
 
-  // Execute command
-  if (payload.type == (uint8_t)sensors::TYPE_RELAY) {
-    setRelay(c.name, payload.state);
-  } else if (payload.type == (uint8_t)sensors::TYPE_DIMMER) {
-    handleDimmer(c.name, (int)payload.value);
+  if (payload.type == (uint8_t)TYPE_RELAY) {
+    setRelayByIndex(idx, payload.state);
+  } else if (payload.type == (uint8_t)TYPE_DIMMER) {
+    dimmerByIndex(idx, (int)payload.value);
   } else {
     return qymera::delivery::ST_INVALID;
   }
@@ -913,7 +764,6 @@ uint8_t onV2Command(
 void onV2CommandAck(
   uint32_t remote_uid,
   const qymera::protocol::v2::CommandAckPayload &payload) {
-  // Log ACK receipt; could track pending commands for retry logic
   logger::coref("V2 Command ACK from %08X entity=%08X status=%d",
                 remote_uid, payload.entity_id, payload.status);
 }

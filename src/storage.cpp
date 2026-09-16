@@ -5,11 +5,14 @@
 #endif
 #include "automations.h"
 #include "core.h"
+#include "entities.h"
 #include "log.h"
 #include "net.h"
 #include "sensors.h"
 
 namespace storage {
+
+using namespace qymera::model;
 
 #if defined(ESP32)
 static Preferences prefs;
@@ -304,27 +307,25 @@ void loadCalibration() {
     CalibrationPersist p = {};
     if (!get(addr, p)) continue;                    // missing/corrupt key on ESP32
     if (p.magic != CALIB_MAGIC || p.version != CALIB_VERSION) continue;  // unprovisioned
-    if (p.uid == 0) continue;
     if (!isfinite(p.min) || !isfinite(p.max) || !isfinite(p.correction)) continue;
     if (p.fade > 3600000UL) continue;               // sane fade cap (1h)
-    int idx = sensors::findCalibByUid(p.uid);       // attach to the exact device
-    if (idx < 0) continue;                          // no registered device with this uid
-    auto &c = sensors::calibrations[idx];
-    if (!c.local) continue;
-    c.pers_state = p.pers_state;
-    c.min = p.min;
-    c.max = p.max;
-    c.correction = p.correction;
-    c.avail = p.avail;
-    c.persist = p.persist;
-    c.pulse = p.pulse;
-    c.pulse_ms = p.pulse_ms;
-    c.fade = p.fade;
-    // Restore stable entity_id from map (v2+)
+    // Attach by slot index: local entities register in a deterministic order
+    // (the sketch), so slot i holds the same entity across unchanged sketches.
+    // The stable identity is restored from the (slot -> entity_id) map.
+    Entity &c = entities::at((uint8_t)i);
+    if (!c.runtime.local) continue;
+    if (c.identity.entity_id == ENTITY_ID_NONE) continue;  // not registered here
     uint32_t eid = loadEntityId(i);
-    if (eid != 0) {
-      c.entity_id = eid;
-    }
+    if (eid != 0) c.identity.entity_id = eid;       // restore stable identity
+    c.config.pers_state = p.pers_state;
+    c.config.min = p.min;
+    c.config.max = p.max;
+    c.config.correction = p.correction;
+    c.state.avail = p.avail;
+    c.config.persist = p.persist;
+    c.config.pulse = p.pulse;
+    c.config.pulse_ms = p.pulse_ms;
+    c.config.fade = p.fade;
   }
 }
 
@@ -332,25 +333,23 @@ void saveCalibrationSlot(int index) {
   if (index < 0 || index >= MAX_PERSISTED_SENSORS) return;
   begin();
   int addr = EEPROM_CALIB_START + index * sizeof(CalibrationPersist);
-  auto &c = sensors::calibrations[index];
+  const Entity &c = entities::peek((uint8_t)index);
   CalibrationPersist current = {};
-  if (c.local && c.uid != 0) {
+  if (c.runtime.local && c.identity.entity_id != 0) {
     current.magic = CALIB_MAGIC;
     current.version = CALIB_VERSION;
-    current.uid = c.uid;
-    current.pers_state = c.pers_state;
-    current.min = c.min;
-    current.max = c.max;
-    current.correction = c.correction;
-    current.avail = c.avail;
-    current.persist = c.persist;
-    current.pulse = c.pulse;
-    current.pulse_ms = c.pulse_ms;
-    current.fade = c.fade;
-    // Persist stable entity_id in separate map
-    if (c.entity_id != 0) {
-      saveEntityId(index, c.entity_id);
-    }
+    current.uid = c.identity.entity_id;  // informational only (identity via map)
+    current.pers_state = c.config.pers_state;
+    current.min = c.config.min;
+    current.max = c.config.max;
+    current.correction = c.config.correction;
+    current.avail = c.state.avail;
+    current.persist = c.config.persist;
+    current.pulse = c.config.pulse;
+    current.pulse_ms = c.config.pulse_ms;
+    current.fade = c.config.fade;
+    // Persist stable entity_id in the (slot -> entity_id) map
+    saveEntityId(index, c.identity.entity_id);
   }
   CalibrationPersist stored = {};
   get(addr, stored);
