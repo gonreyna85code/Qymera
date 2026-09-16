@@ -302,7 +302,8 @@ void factoryReset() {
 
 void loadCalibration() {
   begin();
-  for (int i = 0; i < MAX_PERSISTED_SENSORS; i++) {
+  int cap = MAX_SENSORS < MAX_PERSISTED_SENSORS ? MAX_SENSORS : MAX_PERSISTED_SENSORS;
+  for (int i = 0; i < cap; i++) {
     int addr = EEPROM_CALIB_START + i * sizeof(CalibrationPersist);
     CalibrationPersist p = {};
     if (!get(addr, p)) continue;                    // missing/corrupt key on ESP32
@@ -330,7 +331,7 @@ void loadCalibration() {
 }
 
 void saveCalibrationSlot(int index) {
-  if (index < 0 || index >= MAX_PERSISTED_SENSORS) return;
+  if (index < 0 || index >= MAX_PERSISTED_SENSORS || index >= MAX_SENSORS) return;
   begin();
   int addr = EEPROM_CALIB_START + index * sizeof(CalibrationPersist);
   const Entity &c = entities::peek((uint8_t)index);

@@ -36,6 +36,12 @@ enum JoinOp : uint8_t {
 struct CondSample {
   float value;
   bool state;
+  // Fail-safe availability: false means the sensor is absent, stale (remote
+  // not sighted within NET_TIMEOUT) or its value is invalid (NaN/Inf). While
+  // unavailable a threshold condition releases its engagement (never
+  // satisfied) and an edge condition suppresses transitions. Rules therefore
+  // never fire from data we cannot trust. See Phase 8 audit.
+  bool available = true;
 };
 
 struct Automation {
@@ -115,6 +121,18 @@ inline uint8_t sampleConditions(const Automation &a, AutomationState &s,
   for (uint8_t j = 0; j < a.sensor_count && j < MAX_CONDITIONS; j++) {
     uint8_t cmp = a.c_cmp[j];
     bool state = false;
+
+    if (!smp[j].available) {
+      // Fail-safe policy (Phase 8): an unavailable condition is never
+      // satisfied. Threshold comparators release their hysteresis engagement;
+      // edge comparators keep their armed marker so no artificial edge is
+      // replayed by the transition out of the unavailable state.
+      if (cmp == EDGE_RISING || cmp == EDGE_FALLING) continue;
+      s.cond_active &= ~(1UL << j);
+      s.last[j] = 0;
+      s.counter[j] = 0;
+      continue;
+    }
 
     if (cmp == EDGE_RISING || cmp == EDGE_FALLING) {
       bool raw = smp[j].state;

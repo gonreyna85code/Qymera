@@ -25,17 +25,20 @@ static bool executeAction(const Automation &a, uint8_t index) {
   if (!entities::isUsed(idx) || c.identity.entity_id == 0) return false;
   const uint8_t type = c.config.type;
   const bool state = c.state.state;
+  const bool indeterminate = !c.runtime.local && entities::isStaleRemote(idx);
   const uint32_t entity_id = c.identity.entity_id;
   switch (a.a_action[index]) {
     case ACT_ON:
       if (!qymera::model::isValidType(type) ||
           qymera::model::capabilityOfType(type) != EntityCapability::READ_WRITE) return false;
-      if (!state) sensors::handleToggle(entity_id);
+      // Phase 8: a stale remote mirror never suppresses the command; we cannot
+      // know its real state, so "ensure ON" is attempted regardless.
+      if (indeterminate || !state) sensors::handleToggle(entity_id);
       return true;
     case ACT_OFF:
       if (!qymera::model::isValidType(type) ||
           qymera::model::capabilityOfType(type) != EntityCapability::READ_WRITE) return false;
-      if (state) sensors::handleToggle(entity_id);
+      if (indeterminate || state) sensors::handleToggle(entity_id);
       return true;
     case ACT_TOGGLE:
       if (!qymera::model::isValidType(type) ||
@@ -106,13 +109,22 @@ void tick(uint32_t now_ms) {
     if (isSample) {
       CondSample smp[MAX_CONDITIONS];
       for (int j = 0; j < (int)a.sensor_count && j < MAX_CONDITIONS; j++) {
+        const uint8_t cmp = a.c_cmp[j];
         if (a.c_sensor[j] < MAX_SENSORS && entities::isUsed(a.c_sensor[j])) {
           const Entity &c = entities::peek(a.c_sensor[j]);
+          // Availability (Phase 8): a remote slot that has not been sighted
+          // within NET_TIMEOUT, or a value-based condition fed a non-finite
+          // (NaN/Inf) sample, is unsafe to evaluate.
+          bool fresh = c.runtime.local || !entities::isStaleRemote(a.c_sensor[j]);
+          bool valueBased = (cmp == CMP_GT || cmp == CMP_LT || cmp == CMP_EQ);
           smp[j].value = c.state.value;
           smp[j].state = c.state.state;
+          smp[j].available =
+              fresh && (!valueBased || (!isnan(c.state.value) && !isinf(c.state.value)));
         } else {
           smp[j].value = 0;
           smp[j].state = false;
+          smp[j].available = false;
         }
       }
       uint8_t mask = sampleConditions(a, s, smp, SAMPLE_MS);

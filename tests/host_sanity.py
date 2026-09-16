@@ -913,8 +913,18 @@ def sample_conditions(a, s, smp, sample_ms):
     for j in range(min(a["sensor_count"], MAX_CONDITIONS)):
         cmp = a["c_cmp"][j]
         state = False
+        val = smp[j][0]
+        raw = smp[j][1]
+        avail = smp[j][2] if len(smp[j]) > 2 else True
+
+        if not avail:
+            if cmp not in (EDGE_RISING, EDGE_FALLING):
+                s["cond_active"] &= ~(1 << j)
+                s["last"][j] = 0
+                s["counter"][j] = 0
+            continue
+
         if cmp in (EDGE_RISING, EDGE_FALLING):
-            raw = smp[j][1]
             if raw == s["last"][j]:
                 if s["counter"][j] < debounce:
                     s["counter"][j] += 1
@@ -929,7 +939,6 @@ def sample_conditions(a, s, smp, sample_ms):
                     state = (not declared) and s["stable"][j]
                 s["stable"][j] = 1 if declared else 0
         else:
-            val, _ = smp[j]
             th = a["c_threshold"][j]
             hys = a["c_hys_dec"] * 0.1
             engaged = bool(s["cond_active"] & (1 << j))
@@ -1419,6 +1428,51 @@ check("migration: logical AND -> all-AND ops, delay -> fire_delay",
 # Legacy v1 record is 64 bytes after alignment, 20 records + header fit old 1600.
 check("legacy v1 layout: 64 B records fit old region",
       8 + 20 * 64 <= 1600)
+
+# ---- Phase 8: automation safety (availability/fail-safe) ----
+print("[automation safety]")
+hs = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], actuator_count=1,
+          a_sensor=[0], a_action=[ACT_TOGGLE])
+s = st()
+out = []
+check("safety GT: engages while available",
+      engine_step(hs, s, 100, [(35, False, True)], es) == [0])
+check("safety GT: unavailable mid-hold releases (no fire)",
+      engine_step(hs, s, 200, [(35, False, False)], es) == [])
+check("safety GT: re-engagement after recovery fires again",
+      engine_step(hs, s, 300, [(35, False, True)], es) == [0])
+hs2 = auto(sensor_count=1, c_cmp=[CMP_GT], c_threshold=[30], c_hys_dec=10)
+check("safety GT: unavailable from start never fires (plausible value)",
+      sample_conditions(hs2, st(), [(40.0, False, False)], SAMPLE_MS) == 0)
+check("safety GT: hysteresis released while unavailable",
+      sample_conditions(hs2, st(), [(31.0, False, False)], SAMPLE_MS) == 0)
+eg2 = auto(sensor_count=1, c_cmp=[EDGE_RISING], debounce_ms=0, actuator_count=1,
+           a_sensor=[0], a_action=[ACT_TOGGLE])
+s2 = st()
+out2 = []
+
+
+def es2b(i):
+    out2.append(i)
+    return True
+
+
+check("edge safety: rising suppressed while unavailable",
+      engine_step(eg2, s2, 100, [(0, True, False)], es2b) == [])
+check("edge safety: real rising edge after recovery fires",
+      engine_step(eg2, s2, 200, [(0, True, True)], es2b) == [0])
+aa = auto(sensor_count=2, c_cmp=[CMP_GT, CMP_GT], c_threshold=[30, 30],
+          c_op_bits=0b00, actuator_count=1, a_sensor=[0], a_action=[ACT_TOGGLE])
+sa = st()
+check("safety AND: unavailable sibling blocks fire",
+      engine_step(aa, sa, 100, [(40, False, True), (35, False, False)], es) == [])
+ao = auto(sensor_count=2, c_cmp=[CMP_GT, CMP_GT], c_threshold=[30, 30],
+          c_op_bits=0b01, actuator_count=1, a_sensor=[0],
+          a_action=[ACT_TOGGLE])
+check("safety OR: available sibling fires while other unavailable",
+      engine_step(ao, st(), 100, [(40, False, True), (35, False, False)], es) == [0])
+check("safety policy compaction: Automation layout unchanged at 80 B",
+      _layout + (4 - _layout % 4) % 4 == 80)
 
 print()
 print("host_sanity: %d passed, %d failed" % (PASS, FAIL))

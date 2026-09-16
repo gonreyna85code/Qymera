@@ -69,7 +69,14 @@ typedef WebServer WebServerCompat;
    LIMITES DEL SISTEMA
    ========================= */
 
+/* RAM budget (Phase 10): ESP8266 1MB/80KB-mundo tiene mucho menos heap que
+   ESP32; limitar el numero de entidades da heap de boot usable (~18 KB).
+   ESP8266: 24 entidades max, ESP32/C3: 64. */
+#if defined(ESP8266)
+#define MAX_SENSORS 24
+#else
 #define MAX_SENSORS 64
+#endif
 #define MAX_PERSISTED_SENSORS 40
 #define MAX_RULES 20
 
