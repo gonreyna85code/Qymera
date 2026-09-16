@@ -62,8 +62,9 @@ static void bindLocalSensor(uint8_t idx, const String &name, SensorType type) {
   // Assign stable entity_id on first registration (persisted across reboots).
   if (c.entity_id == 0) {
     c.entity_id = nextEntityId();
-    logger::sensorsf("Entity registered: idx=%d uid=%u entity_id=%08X name=%s",
-                     idx, c.uid, c.entity_id, name.c_str());
+    logger::serialf(logger::SENSORS, logger::INFO,
+                    "Entity registered: idx=%d uid=%u entity_id=%08X name=%s",
+                    idx, c.uid, c.entity_id, name.c_str());
   }
 }
 

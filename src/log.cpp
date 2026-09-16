@@ -91,7 +91,7 @@ static void store_to_buffer(Layer layer, Level level, const char *msg) {
   }
 }
 
-static void output(Layer layer, Level level, const char *msg) {
+static void output(Layer layer, Level level, const char *msg, bool to_gui) {
   // Filter
   if (level < min_level) return;
   if (!layer_enabled[layer]) return;
@@ -101,11 +101,11 @@ static void output(Layer layer, Level level, const char *msg) {
     Serial.printf("[%lu][%s][%s] %s\n", millis(), layer_name(layer), level_name(level), msg);
   }
 
-  // --- GUI buffer (per-layer) ---
-  store_to_buffer(layer, level, msg);
-
-  // --- UDP broadcast ---
-  net::sendLog(layer, level, msg);
+  // --- GUI buffer + UDP broadcast (skipped for serial-only diagnostics) ---
+  if (to_gui) {
+    store_to_buffer(layer, level, msg);
+    net::sendLog(layer, level, msg);
+  }
 }
 
 void logRemote(Layer layer, Level level, const char *msg) {
@@ -125,11 +125,11 @@ void logRemote(Layer layer, Level level, const char *msg) {
 // ================= LOG FUNCTIONS =================
 
 void log(Layer layer, Level level, const char *msg) {
-  output(layer, level, msg);
+  output(layer, level, msg, true);
 }
 
 void log(Layer layer, Level level, const String &msg) {
-  output(layer, level, msg.c_str());
+  output(layer, level, msg.c_str(), true);
 }
 
 void logf(Layer layer, Level level, const char *fmt, ...) {
@@ -138,17 +138,30 @@ void logf(Layer layer, Level level, const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  output(layer, level, buf);
+  output(layer, level, buf, true);
+}
+
+void serial(Layer layer, Level level, const char *msg) {
+  output(layer, level, msg, false);
+}
+
+void serialf(Layer layer, Level level, const char *fmt, ...) {
+  char buf[MAX_LOG_MSG];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  output(layer, level, buf, false);
 }
 
 // ================= CONVENIENCE =================
 
-void core(const char *msg)    { output(CORE, INFO, msg); }
-void core(const String &msg)  { output(CORE, INFO, msg.c_str()); }
-void sensors(const char *msg) { output(SENSORS, INFO, msg); }
-void sensors(const String &msg){ output(SENSORS, INFO, msg.c_str()); }
-void event(const char *msg)   { output(EVENTS, INFO, msg); }
-void event(const String &msg) { output(EVENTS, INFO, msg.c_str()); }
+void core(const char *msg)    { output(CORE, INFO, msg, true); }
+void core(const String &msg)  { output(CORE, INFO, msg.c_str(), true); }
+void sensors(const char *msg) { output(SENSORS, INFO, msg, true); }
+void sensors(const String &msg){ output(SENSORS, INFO, msg.c_str(), true); }
+void event(const char *msg)   { output(EVENTS, INFO, msg, true); }
+void event(const String &msg) { output(EVENTS, INFO, msg.c_str(), true); }
 
 void coref(const char *fmt, ...) {
   char buf[MAX_LOG_MSG];
@@ -156,7 +169,7 @@ void coref(const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  output(CORE, INFO, buf);
+  output(CORE, INFO, buf, true);
 }
 
 void sensorsf(const char *fmt, ...) {
@@ -165,7 +178,7 @@ void sensorsf(const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  output(SENSORS, INFO, buf);
+  output(SENSORS, INFO, buf, true);
 }
 
 void eventf(const char *fmt, ...) {
@@ -174,13 +187,13 @@ void eventf(const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  output(EVENTS, INFO, buf);
+  output(EVENTS, INFO, buf, true);
 }
 
-void warn(const char *msg)    { output(CORE, WARN, msg); }
-void warn(const String &msg)  { output(CORE, WARN, msg.c_str()); }
-void error(const char *msg)   { output(CORE, ERROR, msg); }
-void error(const String &msg) { output(CORE, ERROR, msg.c_str()); }
+void warn(const char *msg)    { output(CORE, WARN, msg, true); }
+void warn(const String &msg)  { output(CORE, WARN, msg.c_str(), true); }
+void error(const char *msg)   { output(CORE, ERROR, msg, true); }
+void error(const String &msg) { output(CORE, ERROR, msg.c_str(), true); }
 
 void warnf(const char *fmt, ...) {
   char buf[MAX_LOG_MSG];
@@ -188,7 +201,7 @@ void warnf(const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  output(CORE, WARN, buf);
+  output(CORE, WARN, buf, true);
 }
 
 void errorf(const char *fmt, ...) {
@@ -197,7 +210,7 @@ void errorf(const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  output(CORE, ERROR, buf);
+  output(CORE, ERROR, buf, true);
 }
 
 // ================= GUI ACCESS =================

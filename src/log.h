@@ -41,6 +41,12 @@ void log(Layer layer, Level level, const char *msg);
 void log(Layer layer, Level level, const String &msg);
 void logf(Layer layer, Level level, const char *fmt, ...);
 
+// Serial-only diagnostics: printed on serial (honoring filters) but never
+// stored in the GUI buffer or broadcast over the net. Use for messages that
+// matter to developers but not to end users (e.g. boot registration details).
+void serial(Layer layer, Level level, const char *msg);
+void serialf(Layer layer, Level level, const char *fmt, ...);
+
 // ================= CONVENIENCE =================
 void core(const char *msg);
 void core(const String &msg);
