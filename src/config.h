@@ -140,6 +140,18 @@ typedef WebServer WebServerCompat;
 #error Entity ID map region overflow
 #endif
 
+/* Storage schema trailer (Phase 9). Lives AFTER the schema-managed regions and
+   is written last on commit: a torn write leaves the CRC stale, so the
+   per-region validation falls back to defaults (atomic-ish, no migration).
+   Whole-store schema: STORAGE_SCHEMA. Unsupported/absent schema -> defaults. */
+#define EEPROM_STORAGE_HEADER_START (EEPROM_ENTITY_ID_START + EEPROM_ENTITY_ID_SIZE)
+#define EEPROM_STORAGE_HEADER_SIZE 24
+#define STORAGE_SCHEMA 3
+
+#if (EEPROM_STORAGE_HEADER_START + EEPROM_STORAGE_HEADER_SIZE) > EEPROM_SIZE
+#error Storage header region overflow
+#endif
+
 /* =========================
    RED
    ========================= */

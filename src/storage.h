@@ -32,6 +32,8 @@ bool verifyOtaIntegrity();
 bool isOtaEnabled();
 bool isOtaIntegrityVerified();
 
+uint32_t commitCount();
+
 void factoryReset();
 
 }  // namespace storage

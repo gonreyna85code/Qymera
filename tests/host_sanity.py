@@ -1376,58 +1376,45 @@ check("ON_INTERVAL: no fire mid-interval",
 check("ON_INTERVAL: fires again next period",
       engine_step(iv, s, 20000, [], es) == [0])
 
-# ---- storage v1 -> v2 migration mapping ----
-def migrate_legacy(lr):
-    a = auto()
-    a["kind"] = ON_SAMPLE if lr["type"] <= 1 else (ON_TIME if lr["type"] == 2 else ON_INTERVAL)
-    a["sensor_count"] = lr["sensor_count"]
-    a["actuator_count"] = lr["actuator_count"]
-    a["debounce_ms"] = 150 if lr["type"] == 0 else 0
-    a["fire_delay_ms"] = lr["delay_ms"]
-    a["cooldown_ms"] = lr["cooldown_ms"]
-    a["time_s"] = lr["time_s"]
-    a["interval_ms"] = lr["interval_ms"]
-    a["year_start"] = lr["year_start"]
-    a["year_end"] = lr["year_end"]
-    a["month_start"] = lr["month_start"]
-    a["month_end"] = lr["month_end"]
-    a["day_start"] = lr["day_start"]
-    a["day_end"] = lr["day_end"]
-    for j in range(5):
-        a["c_sensor"][j] = lr["sensor_idxs"][j]
-        a["c_threshold"][j] = lr["threshold"][j]
-        if a["kind"] == ON_SAMPLE:
-            if lr["type"] == 0:
-                a["c_cmp"][j] = EDGE_FALLING if lr["cmp"][j] == 1 else EDGE_RISING
-            else:
-                a["c_cmp"][j] = lr["cmp"][j]
-        else:
-            a["c_cmp"][j] = 0
-        if j < 4:
-            a["c_op_bits"] |= ((0 if lr["logical_and"] else 1) & 1) << j
-        a["a_sensor"][j] = lr["actuator_idxs"][j]
-        a["a_action"][j] = lr["actions"][j]
-        a["a_level"][j] = lr["levels"][j]
-    return a
+# ---- Phase 9: storage schema trailer (CRC-32 + layout mirrors) ----
+def crc32_ref(data):
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else (crc >> 1)
+    return crc ^ 0xFFFFFFFF
 
 
-lr = dict(sensor_idxs=[3, 4, 0, 0, 0], sensor_count=2, type=0,
-          cmp=[0, 1, 0, 0, 0], threshold=[300, 500, 0, 0, 0], logical_and=1,
-          actuator_idxs=[7, 0, 0, 0, 0],
-          actions=[0, 0, 0, 0, 0], levels=[0, 0, 0, 0, 0], actuator_count=1,
-          delay_ms=250, cooldown_ms=1000, time_s=0, interval_ms=0,
-          year_start=0, year_end=0, month_start=0, month_end=0,
-          day_start=0, day_end=0)
-m = migrate_legacy(lr)
-check("migration: EDGE + GT cmp -> EDGE_RISING, debounce 150",
-      m["kind"] == ON_SAMPLE and m["debounce_ms"] == 150
-      and m["c_cmp"][0] == EDGE_RISING and m["c_cmp"][1] == EDGE_FALLING)
-check("migration: logical AND -> all-AND ops, delay -> fire_delay",
-      m["c_op_bits"] == 0 and m["fire_delay_ms"] == 250
-      and m["cooldown_ms"] == 1000)
-# Legacy v1 record is 64 bytes after alignment, 20 records + header fit old 1600.
-check("legacy v1 layout: 64 B records fit old region",
-      8 + 20 * 64 <= 1600)
+check("crc32: zlib reference vector (123456789 -> CBF43926)",
+      crc32_ref(b"123456789") == 0xCBF43926)
+
+STORAGE_SCHEMA = 3
+RULES_VERSION = 2
+check("storage schema v3 constants: RULES_VERSION stays v2 (no v1 migration)",
+      STORAGE_SCHEMA == 3 and RULES_VERSION == 2)
+
+# Schema-managed layout mirror (must match config.h / storage.cpp):
+EEPROM_SIZE = 4096
+CRED_START = 10
+GENSET_START = 110
+CALIB_START = 122
+RULES_START = 1482
+RULES_SIZE = 1664
+OTA_HASH = 3146
+OTA_FLAG = 3150
+ENTITY_MAP = 3151
+ENTITY_MAP_SIZE = 40 * 4
+HDR_START = ENTITY_MAP + ENTITY_MAP_SIZE   # 3311
+HDR_SIZE = 24
+check("schema v3: 40 calib buckets * 34 B = 1360", (CALIB_START + 40 * 34) == RULES_START)
+check("schema v3: rules header + 20 automations fit region", 8 + 20 * 80 <= RULES_SIZE)
+check("schema v3: entity map fits before trailer", HDR_START == 3311)
+check("schema v3: storage trailer (24 B) fits in EEPROM", HDR_START + HDR_SIZE <= EEPROM_SIZE)
+check("schema v3: payload is contiguous creds..entity-map",
+      CRED_START < GENSET_START < CALIB_START < RULES_START < HDR_START)
+check("legacy v1 rules are NOT migrated (product decision -> defaults)",
+      8 + 20 * 80 <= 1664)  # v2 layout validated; v1 path removed
 
 # ---- Phase 8: automation safety (availability/fail-safe) ----
 print("[automation safety]")

@@ -14,6 +14,9 @@ namespace storage {
 
 using namespace qymera::model;
 
+/* Set by every put/write(); commit() stamps the schema trailer before flush. */
+static bool schema_dirty = false;
+
 #if defined(ESP32)
 static Preferences prefs;
 static bool prefs_ready = false;
@@ -25,7 +28,12 @@ void begin() {
   }
 }
 uint8_t read(int addr) { return prefs.getUChar(String(addr).c_str(), 0); }
-void write(int addr, uint8_t val) { prefs.putUChar(String(addr).c_str(), val); }
+/* writeBackend/putBackend: platform store WITHOUT dirtying the schema (used by
+   the storage-header stamp, which runs inside commit() itself). */
+void writeBackend(int addr, uint8_t val) { prefs.putUChar(String(addr).c_str(), val); }
+template<typename T> bool putBackend(int addr, const T &obj) {
+  return prefs.putBytes(String(addr).c_str(), &obj, sizeof(T)) == sizeof(T);
+}
 template<typename T> bool get(int addr, T &obj) {
   // IMPORTANT: prefs.getBytes() leaves the buffer untouched when the key is
   // missing or corrupted. Zero-fill first so unprovisioned slots never expose
@@ -35,18 +43,25 @@ template<typename T> bool get(int addr, T &obj) {
   return n == sizeof(T);
 }
 template<typename T> bool put(int addr, const T &obj) {
-  return prefs.putBytes(String(addr).c_str(), &obj, sizeof(T)) == sizeof(T);
+  schema_dirty = true;
+  return putBackend(addr, obj);
 }
-void commit() {}
 void clearAll() { prefs.clear(); }
 
 #else
 void begin() { EEPROM.begin(EEPROM_SIZE); }
 uint8_t read(int addr) { return EEPROM.read(addr); }
-void write(int addr, uint8_t val) { EEPROM.write(addr, val); }
+void writeBackend(int addr, uint8_t val) { EEPROM.write(addr, val); }
+template<typename T> bool putBackend(int addr, const T &obj) {
+  EEPROM.put(addr, obj);
+  return true;
+}
 template<typename T> bool get(int addr, T &obj) { EEPROM.get(addr, obj); return true; }
-template<typename T> bool put(int addr, const T &obj) { EEPROM.put(addr, obj); return true; }
-void commit() { EEPROM.commit(); }
+template<typename T> bool put(int addr, const T &obj) {
+  schema_dirty = true;
+  EEPROM.put(addr, obj);
+  return true;
+}
 void clearAll() {
   memset(EEPROM.getDataPtr() + EEPROM_RELAY_STATE_START, 0, EEPROM_RELAY_STATE_SIZE);
   memset(EEPROM.getDataPtr() + EEPROM_CRED_START, 0, EEPROM_CRED_SIZE);
@@ -54,6 +69,99 @@ void clearAll() {
 }
 
 #endif
+
+/* ==========================================================================
+   STORAGE SCHEMA TRAILER (Phase 9)
+   Whole-store schema version + CRC. The header lives at the END of the
+   schema-managed payload and is stamped before every flash commit, so:
+
+   * old-format or unsupported schema  -> per-region validation, defaults
+   * torn/corrupt write                -> CRC mismatch, per-region defaults
+   * commit_count                      -> explicit wear observability
+   ========================================================================== */
+
+/* Shared byte write: dirties the schema (the stamp happens in commit()). */
+void write(int addr, uint8_t val) { schema_dirty = true; writeBackend(addr, val); }
+
+uint32_t commitCount();
+
+static const uint32_t STORAGE_MAGIC = 0x51594D52;  // "QYMR"
+
+struct StorageHeader {
+  uint32_t magic;          // STORAGE_MAGIC
+  uint16_t schema;         // STORAGE_SCHEMA
+  uint16_t flags;          // 0
+  uint32_t crc;            // CRC-32 over the schema-managed payload
+  uint32_t commit_count;   // monotonic (wear observability)
+  uint32_t reserved[2];
+};
+static_assert(sizeof(StorageHeader) == EEPROM_STORAGE_HEADER_SIZE,
+              "StorageHeader must match EEPROM_STORAGE_HEADER_SIZE");
+
+// Incremental CRC-32 over the schema-managed payload [creds .. header).
+static uint32_t crcPayload() {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (int addr = EEPROM_CRED_START; addr < EEPROM_STORAGE_HEADER_START; addr++) {
+    crc ^= read(addr);
+    for (int b = 0; b < 8; b++) {
+      crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+    }
+  }
+  return crc ^ 0xFFFFFFFFu;
+}
+
+static void stampHeader() {
+  StorageHeader h{};
+  h.magic = STORAGE_MAGIC;
+  h.schema = STORAGE_SCHEMA;
+  h.flags = 0;
+  h.crc = crcPayload();
+  h.commit_count = commitCount() + 1;
+  h.reserved[0] = 0;
+  h.reserved[1] = 0;
+  putBackend(EEPROM_STORAGE_HEADER_START, h);
+}
+
+// Validates (or diagnoses) the store schema. Called once, at the first
+// schema-managed load. No migration code: an unsupported/absent header means
+// each region is validated by its own magic and unreadable regions fall back
+// to defaults; the current store is adopted (re-stamped) on the next commit.
+static void initSchema() {
+  begin();
+  StorageHeader h{};
+  get(EEPROM_STORAGE_HEADER_START, h);
+  if (h.magic == STORAGE_MAGIC && h.schema == STORAGE_SCHEMA) {
+    if (crcPayload() == h.crc) {
+      logger::core("Storage schema v3 verified (CRC ok)");
+    } else {
+      logger::warnf("Storage schema v3 CRC MISMATCH (stored:%08X) - corrupt writes fall back to per-region defaults",
+                    (unsigned)h.crc);
+    }
+  } else if (h.magic != STORAGE_MAGIC) {
+    logger::warn("Storage header absent - adopting schema v3 on next commit (no migration)");
+  } else {
+    logger::warnf("Storage schema unsupported (%u) - per-region defaults", (unsigned)h.schema);
+  }
+}
+
+/* Single commit chokepoint: stamp the schema trailer on any dirty write, then
+   flush the platform backend. All writes in this module go through put(). */
+void commit() {
+  if (schema_dirty) {
+    schema_dirty = false;
+    stampHeader();
+  }
+#if !defined(ESP32)
+  EEPROM.commit();
+#endif
+}
+
+uint32_t commitCount() {
+  begin();
+  StorageHeader h{};
+  get(EEPROM_STORAGE_HEADER_START, h);
+  return (h.magic == STORAGE_MAGIC && h.schema == STORAGE_SCHEMA) ? h.commit_count : 0;
+}
 
 /* Persisted calibration slot.
    v1: magic/version/uid/... (legacy)
@@ -86,68 +194,6 @@ struct RulesHeader {
 
 static const uint32_t RULES_MAGIC = 0x4155544F;  // "AUTO"
 static const uint16_t RULES_VERSION = 2;
-
-struct LegacyRule {
-  uint8_t sensor_idxs[5];
-  uint8_t sensor_count;
-  uint8_t type;
-  uint8_t cmp[5];
-  int16_t threshold[5];
-  uint8_t logical_and;
-  uint8_t actuator_idxs[5];
-  uint8_t actions[5];
-  uint8_t levels[5];
-  uint8_t actuator_count;
-  uint16_t delay_ms;
-  uint32_t cooldown_ms;
-  uint32_t time_s;
-  uint32_t interval_ms;
-  uint16_t year_start;
-  uint16_t year_end;
-  uint8_t month_start;
-  uint8_t month_end;
-  uint8_t day_start;
-  uint8_t day_end;
-};
-
-static automations::Automation migrateLegacy(const LegacyRule &lr) {
-  using namespace automations;
-  Automation a{};
-  a.kind = (lr.type <= 1) ? ON_SAMPLE : (lr.type == 2 ? ON_TIME : ON_INTERVAL);
-  a.sensor_count = lr.sensor_count;
-  a.actuator_count = lr.actuator_count;
-  a.debounce_ms = (lr.type == 0) ? 150 : 0;
-  a.fire_delay_ms = lr.delay_ms;
-  a.cooldown_ms = lr.cooldown_ms;
-  a.time_s = lr.time_s;
-  a.interval_ms = lr.interval_ms;
-  a.year_start = lr.year_start;
-  a.year_end = lr.year_end;
-  a.month_start = lr.month_start;
-  a.month_end = lr.month_end;
-  a.day_start = lr.day_start;
-  a.day_end = lr.day_end;
-  for (int j = 0; j < 5; j++) {
-    a.c_sensor[j] = lr.sensor_idxs[j];
-    a.c_threshold[j] = lr.threshold[j];
-    if (a.kind == ON_SAMPLE) {
-      if (lr.type == 0) {
-        a.c_cmp[j] = (lr.cmp[j] == 1) ? EDGE_FALLING : EDGE_RISING;
-      } else {
-        a.c_cmp[j] = lr.cmp[j];
-      }
-    } else {
-      a.c_cmp[j] = CMP_GT;
-    }
-    if (j < 4) {
-      a.c_op_bits |= ((lr.logical_and ? JOIN_AND : JOIN_OR) & 1) << j;
-    }
-    a.a_sensor[j] = lr.actuator_idxs[j];
-    a.a_action[j] = lr.actions[j];
-    a.a_level[j] = lr.levels[j];
-  }
-  return a;
-}
 
 // Entity ID map helpers (slot_index -> entity_id)
 static inline int entityIdMapAddr(int slot) {
@@ -274,10 +320,18 @@ void saveGeneralSettings(uint16_t broadcast_port, uint16_t command_port, uint32_
   if (broadcast_port < 1024 || broadcast_port > 65500) broadcast_port = BROADCAST_PORT;
   if (command_port < 1024 || command_port > 65500) command_port = COMMAND_PORT;
   if (report_interval < 5000 || report_interval > 600000) report_interval = BROADCAST_INTERVAL;
+  // Write minimization: skip the flash commit when nothing changed.
+  uint16_t cb = 0, cc = 0;
+  uint32_t ci = 0;
+  int raddr = EEPROM_GENSET_START;
+  get(raddr, cb); raddr += sizeof(uint16_t);
+  get(raddr, cc); raddr += sizeof(uint16_t);
+  get(raddr, ci);
+  if (cb == broadcast_port && cc == command_port && ci == report_interval) return;
   int addr = EEPROM_GENSET_START;
   put(addr, broadcast_port); addr += sizeof(uint16_t);
   put(addr, command_port); addr += sizeof(uint16_t);
-  put(addr, report_interval); addr += sizeof(uint32_t);
+  put(addr, report_interval);
   commit();
 }
 
@@ -300,24 +354,61 @@ void factoryReset() {
   RESET_MCU();
 }
 
+/* Calibration buckets keyed by identity.entity_id, NOT by runtime slot, so
+   persistence is independent of registration order (Phase 9). A bucket is
+   owned when magic+version+uid are valid; otherwise it is reusable. */
+static inline int calibBucketAddr(int bucket) {
+  return EEPROM_CALIB_START + bucket * (int)sizeof(CalibrationPersist);
+}
+
+static int findCalibBucket(uint32_t eid) {
+  if (eid == 0) return -1;
+  for (int b = 0; b < MAX_PERSISTED_SENSORS; b++) {
+    CalibrationPersist p{};
+    get(calibBucketAddr(b), p);
+    if (p.magic == CALIB_MAGIC && p.version == CALIB_VERSION && p.uid == eid) return b;
+  }
+  return -1;
+}
+
+static int allocCalibBucket() {
+  for (int b = 0; b < MAX_PERSISTED_SENSORS; b++) {
+    CalibrationPersist p{};
+    get(calibBucketAddr(b), p);
+    if (p.magic != CALIB_MAGIC || p.version != CALIB_VERSION) return b;
+  }
+  return -1;
+}
+
 void loadCalibration() {
+  initSchema();
   begin();
+
+  // Domain 1 - IDENTITY: restore the stable entity_id from the (slot -> eid)
+  // map. Registered local entities own their identity; this map is the only
+  // persistence that references the runtime slot (registration order), by
+  // design, and just restores cryptographic-looking stable ids.
   int cap = MAX_SENSORS < MAX_PERSISTED_SENSORS ? MAX_SENSORS : MAX_PERSISTED_SENSORS;
   for (int i = 0; i < cap; i++) {
-    int addr = EEPROM_CALIB_START + i * sizeof(CalibrationPersist);
-    CalibrationPersist p = {};
-    if (!get(addr, p)) continue;                    // missing/corrupt key on ESP32
-    if (p.magic != CALIB_MAGIC || p.version != CALIB_VERSION) continue;  // unprovisioned
+    Entity &c = entities::at((uint8_t)i);
+    if (!c.runtime.local || c.identity.entity_id == ENTITY_ID_NONE) continue;
+    uint32_t eid = loadEntityId(i);
+    if (eid != 0) c.identity.entity_id = eid;   // restore stable identity
+  }
+
+  // Domain 2 - CONFIGURATION + RUNTIME STATE: apply calibration keyed by
+  // entity_id, never by runtime slot.
+  for (int b = 0; b < MAX_PERSISTED_SENSORS; b++) {
+    CalibrationPersist p{};
+    get(calibBucketAddr(b), p);
+    if (p.magic != CALIB_MAGIC || p.version != CALIB_VERSION) continue;
+    if (p.uid == 0 || p.uid == 0xFFFFFFFFu) continue;
     if (!isfinite(p.min) || !isfinite(p.max) || !isfinite(p.correction)) continue;
     if (p.fade > 3600000UL) continue;               // sane fade cap (1h)
-    // Attach by slot index: local entities register in a deterministic order
-    // (the sketch), so slot i holds the same entity across unchanged sketches.
-    // The stable identity is restored from the (slot -> entity_id) map.
-    Entity &c = entities::at((uint8_t)i);
+    int8_t idx = entities::findById(p.uid);
+    if (idx < 0) continue;                          // not present on this node
+    Entity &c = entities::at((uint8_t)idx);
     if (!c.runtime.local) continue;
-    if (c.identity.entity_id == ENTITY_ID_NONE) continue;  // not registered here
-    uint32_t eid = loadEntityId(i);
-    if (eid != 0) c.identity.entity_id = eid;       // restore stable identity
     c.config.pers_state = p.pers_state;
     c.config.min = p.min;
     c.config.max = p.max;
@@ -328,30 +419,42 @@ void loadCalibration() {
     c.config.pulse_ms = p.pulse_ms;
     c.config.fade = p.fade;
   }
+
+  logger::coref("Storage commit count: %u", (unsigned)commitCount());
 }
 
 void saveCalibrationSlot(int index) {
   if (index < 0 || index >= MAX_PERSISTED_SENSORS || index >= MAX_SENSORS) return;
   begin();
-  int addr = EEPROM_CALIB_START + index * sizeof(CalibrationPersist);
   const Entity &c = entities::peek((uint8_t)index);
-  CalibrationPersist current = {};
-  if (c.runtime.local && c.identity.entity_id != 0) {
-    current.magic = CALIB_MAGIC;
-    current.version = CALIB_VERSION;
-    current.uid = c.identity.entity_id;  // informational only (identity via map)
-    current.pers_state = c.config.pers_state;
-    current.min = c.config.min;
-    current.max = c.config.max;
-    current.correction = c.config.correction;
-    current.avail = c.state.avail;
-    current.persist = c.config.persist;
-    current.pulse = c.config.pulse;
-    current.pulse_ms = c.config.pulse_ms;
-    current.fade = c.config.fade;
-    // Persist stable entity_id in the (slot -> entity_id) map
-    saveEntityId(index, c.identity.entity_id);
+  if (!c.runtime.local || c.identity.entity_id == ENTITY_ID_NONE) return;
+
+  uint32_t eid = c.identity.entity_id;
+  int bucket = findCalibBucket(eid);
+  if (bucket < 0) bucket = allocCalibBucket();
+  if (bucket < 0) {
+    logger::warn("Calibration buckets exhausted (wear guard)");
+    return;
   }
+
+  // Persist stable identity in the (slot -> entity_id) map.
+  saveEntityId((uint8_t)index, eid);
+
+  int addr = calibBucketAddr(bucket);
+  CalibrationPersist current{};
+  current.magic = CALIB_MAGIC;
+  current.version = CALIB_VERSION;
+  current.uid = eid;
+  current.pers_state = c.config.pers_state;
+  current.min = c.config.min;
+  current.max = c.config.max;
+  current.correction = c.config.correction;
+  current.avail = c.state.avail;
+  current.persist = c.config.persist;
+  current.pulse = c.config.pulse;
+  current.pulse_ms = c.config.pulse_ms;
+  current.fade = c.config.fade;
+
   CalibrationPersist stored = {};
   get(addr, stored);
   if (memcmp(&current, &stored, sizeof(CalibrationPersist)) != 0) {
@@ -371,28 +474,21 @@ void loadRules() {
   int addr = EEPROM_RULES_START;
   get(addr, h);
   addr += sizeof(RulesHeader);
-  if (h.magic != RULES_MAGIC) {
-    memset(automations::rules, 0, sizeof(automations::rules));
-    return;
-  }
-  if (h.version == RULES_VERSION) {
+  if (h.magic == RULES_MAGIC && h.version == RULES_VERSION) {
     for (int i = 0; i < MAX_RULES; i++) {
       get(addr, automations::rules[i]);
       addr += sizeof(automations::Automation);
     }
     return;
   }
-  if (h.version == 1) {
-    LegacyRule legacy[MAX_RULES];
-    for (int i = 0; i < MAX_RULES; i++) {
-      get(addr, legacy[i]);
-      addr += sizeof(LegacyRule);
-    }
-    for (int i = 0; i < MAX_RULES; i++) {
-      automations::rules[i] = migrateLegacy(legacy[i]);
-    }
-    saveRules();
-    return;
+  // No migration (product decision): any unsupported/absent/corrupt schema
+  // drops the region to factory defaults.
+  if (h.magic == RULES_MAGIC && h.version == 1) {
+    logger::warn("Rules region is legacy schema v1 - reset to defaults (no migration)");
+  } else if (h.magic != RULES_MAGIC) {
+    logger::core("Rules region unprovisioned - defaults");
+  } else {
+    logger::warnf("Rules region corrupt (schema %u) - defaults", (unsigned)h.version);
   }
   memset(automations::rules, 0, sizeof(automations::rules));
 }
