@@ -294,6 +294,20 @@ void loop() {
   sensors::applyFades();
   sensors::checkPulses();
 
+  /// 4b) Serial-only heap telemetry (Phase 10 memory budget). Kept out of the
+  //     GUI log buffer: it is a developer diagnostic, not user-facing.
+  static uint32_t last_heap_log = 0;
+  if (millis() - last_heap_log >= 30000) {
+    last_heap_log = millis();
+    uint32_t heap_free = ESP.getFreeHeap();
+    uint8_t heap_frag = 0;
+#if defined(PLATFORM_ESP8266)
+    heap_frag = ESP.getHeapFragmentation();
+#endif
+    logger::serialf(logger::CORE, logger::INFO, "heap free=%u B frag=%u%%",
+                    heap_free, heap_frag);
+  }
+
   /// 6) Reporte periódico cuando llegue el intervalo configurado.
   if (millis() - last_report >= genset.report_interval) {
     last_report = millis();

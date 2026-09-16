@@ -476,15 +476,20 @@ ICACHE_FLASH_ATTR void handleRules() {
     server.send(405, "text/plain", "GET required");
     return;
   }
-  String json;
-  json.reserve(4096);
-  json += '[';
+  // Streamed (chunked) like /calib & /logs: building one String with
+  // reserve(4096) OOMs the ESP8266 heap once rules are configured. Emitted
+  // byte-for-byte the same JSON as before (thresholds are int16_t).
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent_P(PSTR("["));
   bool first = true;
+  char obj[320];
   for (int i = 0; i < MAX_RULES; i++) {
     const automations::Automation &r = automations::rules[i];
     if (r.sensor_count == 0 && r.actuator_count == 0)
       continue;
-    if (!first) json += ',';
+    int n = 0;
+    if (!first) obj[n++] = ',';
     first = false;
     int jsonType;
     if (r.kind == automations::ON_TIME) jsonType = automations::RULE_TIME;
@@ -500,86 +505,56 @@ ICACHE_FLASH_ATTR void handleRules() {
     for (int j = 0; j + 1 < (int)r.sensor_count && j < (int)automations::MAX_CONDITIONS - 1; j++) {
       if ((r.c_op_bits & (1 << j)) != 0) logicAnd = false;
     }
-    json += "{\"id\":";
-    json += i;
-    json += ",\"sensors\":[";
+    n += snprintf(obj + n, sizeof(obj) - n, "{\"id\":%d,\"sensors\":[", i);
     for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
-      if (s) json += ',';
-      json += r.c_sensor[s];
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%u", s ? "," : "", (unsigned)r.c_sensor[s]);
     }
-    json += "],\"type\":";
-    json += jsonType;
-    json += ",\"logical_and\":";
-    json += logicAnd;
-    json += ",\"cmp\":[";
+    n += snprintf(obj + n, sizeof(obj) - n, "],\"type\":%d,\"logical_and\":%d,\"cmp\":[",
+                  jsonType, logicAnd ? 1 : 0);
     for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
-      if (s) json += ',';
       int c = r.c_cmp[s];
       if (c == automations::EDGE_RISING) c = 0;
       else if (c == automations::EDGE_FALLING) c = 1;
-      json += c;
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%d", s ? "," : "", c);
     }
-    json += "],\"threshold\":[";
+    n += snprintf(obj + n, sizeof(obj) - n, "],\"threshold\":[");
     for (int s = 0; s < (int)r.sensor_count && s < (int)automations::MAX_CONDITIONS; s++) {
-      if (s) json += ',';
-      json += r.c_threshold[s];
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%d", s ? "," : "", (int)r.c_threshold[s]);
     }
-    json += "],\"actuators\":[";
+    n += snprintf(obj + n, sizeof(obj) - n, "],\"actuators\":[");
     for (int a = 0; a < (int)r.actuator_count && a < (int)automations::MAX_ACTIONS; a++) {
-      if (a) json += ',';
-      json += r.a_sensor[a];
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%u", a ? "," : "", (unsigned)r.a_sensor[a]);
     }
-    json += "],\"actions\":[";
+    n += snprintf(obj + n, sizeof(obj) - n, "],\"actions\":[");
     for (int a = 0; a < (int)r.actuator_count && a < (int)automations::MAX_ACTIONS; a++) {
-      if (a) json += ',';
-      json += r.a_action[a];
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%u", a ? "," : "", (unsigned)r.a_action[a]);
     }
-    json += "],\"levels\":[";
+    n += snprintf(obj + n, sizeof(obj) - n, "],\"levels\":[");
     for (int a = 0; a < (int)r.actuator_count && a < (int)automations::MAX_ACTIONS; a++) {
-      if (a) json += ',';
-      json += r.a_level[a];
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%u", a ? "," : "", (unsigned)r.a_level[a]);
     }
-    json += "],\"delay_ms\":";
-    json += r.fire_delay_ms;
-    json += ",\"cooldown_ms\":";
-    json += r.cooldown_ms;
-    json += ",\"time_s\":";
-    json += r.time_s;
-    json += ",\"interval_ms\":";
-    json += r.interval_ms;
-    json += ",\"year_start\":";
-    json += r.year_start;
-    json += ",\"year_end\":";
-    json += r.year_end;
-    json += ",\"month_start\":";
-    json += r.month_start;
-    json += ",\"month_end\":";
-    json += r.month_end;
-    json += ",\"day_start\":";
-    json += r.day_start;
-    json += ",\"day_end\":";
-    json += r.day_end;
-    json += ",\"debounce_ms\":";
-    json += r.debounce_ms;
-    json += ",\"for_ms\":";
-    json += r.for_ms;
-    json += ",\"step_ms\":";
-    json += r.step_ms;
-    json += ",\"hys\":";
-    json += r.c_hys_dec;
-    json += ",\"ops\":[";
+    n += snprintf(obj + n, sizeof(obj) - n,
+                  "],\"delay_ms\":%lu,\"cooldown_ms\":%lu,\"time_s\":%lu,\"interval_ms\":%lu,"
+                  "\"year_start\":%u,\"year_end\":%u,\"month_start\":%u,\"month_end\":%u,"
+                  "\"day_start\":%u,\"day_end\":%u,\"debounce_ms\":%lu,\"for_ms\":%lu,"
+                  "\"step_ms\":%lu,\"hys\":%u,\"ops\":[",
+                  (unsigned long)r.fire_delay_ms, (unsigned long)r.cooldown_ms,
+                  (unsigned long)r.time_s, (unsigned long)r.interval_ms,
+                  (unsigned)r.year_start, (unsigned)r.year_end,
+                  (unsigned)r.month_start, (unsigned)r.month_end,
+                  (unsigned)r.day_start, (unsigned)r.day_end,
+                  (unsigned long)r.debounce_ms, (unsigned long)r.for_ms,
+                  (unsigned long)r.step_ms, (unsigned)r.c_hys_dec);
     for (int j = 0; j + 1 < (int)r.sensor_count && j < (int)automations::MAX_CONDITIONS - 1; j++) {
-      if (j) json += ',';
-      json += ((r.c_op_bits & (1 << j)) != 0) ? 1 : 0;
+      n += snprintf(obj + n, sizeof(obj) - n, "%s%d", j ? "," : "",
+                    ((r.c_op_bits & (1 << j)) != 0) ? 1 : 0);
     }
-    json += "],\"retry\":";
-    json += r.retry_max;
-    json += ",\"retry_interval\":";
-    json += r.retry_interval_s;
-    json += '}';
+    n += snprintf(obj + n, sizeof(obj) - n, "],\"retry\":%u,\"retry_interval\":%u}",
+                  (unsigned)r.retry_max, (unsigned)r.retry_interval_s);
+    if (n > 0) server.sendContent(String(obj));
   }
-  json += ']';
-  server.send(200, "application/json", json);
+  server.sendContent_P(PSTR("]"));
+  server.sendContent("");
 }
 
 void handleSetRule() {
