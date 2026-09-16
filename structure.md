@@ -1,9 +1,9 @@
-# Qymeras Structure & Ownership
+# Qymera Structure & Ownership
 
-Updated 2026-08-30 (Qymera 1.2 GUI release, `main` after merge). `main` is the
-**Qymera 1.2 release** (GUI over the frozen 1.1 deterministic core). Branch map:
-1.1 = historical frozen `main` baseline · 1.2 = `main` (this tree, GUI
-release) · Dashboard/AI = `feature/ai-experiments` + future (separate
+Updated 2026-09-15 (Qymera 1.0.0 STABLE, official repo `gonreyna85code/Qymera`).
+`main` is the **1.0.0 stable release** (deterministic core + Web OTA + GUI).
+Branch map: `main` = 1.0.0 stable (this tree) · historical 1.1/1.2 = frozen
+baseline history · Dashboard/AI = `feature/ai-experiments` + future (separate
 direction). Mirrors the actual source tree — files not listed here do not exist
 in `src/`.
 

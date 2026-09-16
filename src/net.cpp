@@ -51,6 +51,7 @@ static void deliveryTick(uint32_t now_ms);
 // legacy net::setTransport/getTransport API (core.cpp selects WiFi vs AP mode).
 
 void setTransport(Transport t) {
+  if (getTransport() == t) return;
   qymera::transport::setActive(
     t == TRANSPORT_ESPNOW ? qymera::transport::Kind::ESP_NOW
                           : qymera::transport::Kind::UDP);

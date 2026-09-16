@@ -1,28 +1,26 @@
-# Qymeras 1.1 Progress Tracker
+# Qymera Progress Tracker
 
-## Current State (updated 2026-08-30)
+## Current State (updated 2026-09-15)
 
-- **Qymera 1.2 = GUI release, becoming `main` on merge.** Built on the frozen
-  1.1 deterministic core (no AI code: `ai.cpp`/`ai.h`, `sensors::aidig`/`aiana`,
-  QMAI EEPROM block all removed). Deterministic core intact, builds green on 3
-  envs, host suite 45/45, unified `Qymera::` public API.
-- **Branch map:** 1.1 = historical frozen `main` baseline · 1.2 = `main`
-  (this tree, GUI release; delivered via `backup/gui-main-merge-20260830`) ·
-  Dashboard/AI = `feature/ai-experiments` + future (separate direction, kept
-  out of 1.1/1.2).
-- **Fleet (2026-08-30):** both boards flashed with the 1.2 integration
-  candidate (`fe20e7f`) and live. ESP8266 = **192.168.1.16** (device_uid
-  12014147; DHCP drifted from .19 after the GUI reflash, taking the ESP32's old
-  lease) — 12 local entities, all endpoints healthy. ESP32 = **192.168.1.19**
-  (device_uid 183646728) — 12 local entities, healthy. Full mesh cross-visible:
-  each node reports 11 remote entities of the other. OTA flags off.
-- **Remaining before the production gate (all hardware-required):** 24h memory
-  soak, factory-reset hw test, longer endurance, ESP32-C3/S2/S3 hw validation.
+- **Qymera 1.0.0 = STABLE release** (`main`, official repo `gonreyna85code/Qymera`,
+  tag `v1.0.0`). Built on the frozen deterministic core (no AI code). Adds **Web
+  OTA** (manifest + SHA-256 verified over pinned TLS from GitHub Releases), the
+  bilingual ES/EN web GUI, and the release pipeline (3 platforms + host tests +
+  assets + manifest). Deterministic core intact, builds green on 3 envs, host
+  suite 212/212, repo migrated with full history.
+- **Branch map:** `main` = 1.0.0 stable (this tree) · historical 1.1/1.2 = frozen
+  baseline history · Dashboard/AI = `feature/ai-experiments` + future (separate
+  direction, kept out of production).
+- **Remaining before the full production gate (all hardware-required):** 24h
+  memory soak, factory-reset hw test, longer endurance, ESP32-C3/S2/S3 hw
+  validation. Inherited from the frozen core; not part of the 1.0.0 scope.
+- **Web OTA live:** release `v1.0.0` published with `qymera-manifest.json`.
+  Device OTA entry points: `POST /firmware/check`, `POST /firmware/update`
+  (see README → "Firmware Updates (Web OTA)").
 - **AI subsystem:** authorized (see `AGENTS.md` "Scope Change Authorization
   2026-08"), developed ONLY on `feature/ai-experiments`. LLM tool-loop experiments
-  against the device API (`qwen3.5:2b`/Ollama probe payloads) were cleaned from
-  the repo root on 2026-08-27 (archived to a workspace-external backup); they
-  are not part of the 1.1 tree.
+  were cleaned from the repo root on 2026-08-27; they are not part of the
+  production tree.
 
 ---
 
