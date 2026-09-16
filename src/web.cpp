@@ -332,7 +332,17 @@ void handleDimmerApi() {
 
 void handleLogs() {
   addCorsHeaders();
-  server.send(200, "application/json", logger::getRecentLogsJson());
+  // Streamed (sendContent) instead of a single big String: the ESP8266 cannot
+  // build large JSON responses without exhausting its heap mid-response.
+  // CONTENT_LENGTH_UNKNOWN makes both cores reply chunked, exactly like root.
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent_P(PSTR("["));
+  logger::streamRecentLogsJson([](const char *chunk) {
+    server.sendContent(String(chunk));
+  });
+  server.sendContent_P(PSTR("]"));
+  server.sendContent("");
 }
 
 void handleLogsClear() {
@@ -937,15 +947,33 @@ void handleSetRule() {
   server.send(200, "text/plain", "ok");
 }
 
+// Minimal JSON string escaping into a bounded buffer (no heap use).
+static void jsonStringInto(char *dst, size_t cap, const char *src) {
+  size_t w = 0;
+  for (const char *p = src; *p && w + 1 < cap; p++) {
+    char c = *p;
+    if (c == '"' || c == '\\') {
+      if (w + 2 < cap) { dst[w++] = '\\'; dst[w++] = c; }
+    } else if (c < 0x20) {
+      if (w + 1 < cap) dst[w++] = ' ';
+    } else {
+      dst[w++] = c;
+    }
+  }
+  dst[w] = '\0';
+}
+
 ICACHE_FLASH_ATTR void handleCalib() {
   addCorsHeaders();
   if (server.method() != HTTP_GET) {
     server.send(405, "text/plain", "Method Not Allowed");
     return;
   }
-  String json;
-  json.reserve(8192);
-  json += '[';
+  // Streamed per-entity (no big String): keeps the ESP8266 heap stable even
+  // with dozens of mirrored entities. CONTENT_LENGTH_UNKNOWN -> chunked reply.
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent_P(PSTR("["));
   bool firstObj = true;
   for (int i = 0; i < MAX_SENSORS; i++) {
     const Entity &c = entities::peek((uint8_t)i);
@@ -953,7 +981,7 @@ ICACHE_FLASH_ATTR void handleCalib() {
     // and remote entries that are still within NET_TIMEOUT. Stale remotes,
     // SENSOR_NONE and invalid/garbage types are never reported as devices.
     if (!entities::isVisible((uint8_t)i)) continue;
-    if (!firstObj) json += ',';
+    if (!firstObj) server.sendContent_P(PSTR(","));
     firstObj = false;
 
     char buf[24];
@@ -963,46 +991,59 @@ ICACHE_FLASH_ATTR void handleCalib() {
       dtostrf(c.state.value, 0, 4, buf);
     }
 
-    json += "{\"id\":";
-    json += c.identity.entity_id;
-    json += ",\"index\":";
-    json += i;
-    json += ",\"device_uid\":";
-    json += (c.runtime.local ? GET_CHIP_ID() : c.identity.device_id);
-    json += ",\"name\":\"";
-    json += c.config.name;
-    json += "\",\"value\":";
-    json += buf;
-
-    char fb[24];
-    dtostrf(isnan(c.config.correction) || isinf(c.config.correction) ? 0.0f : c.config.correction, 0, 4, fb); json += ",\"correction\":";  json += fb;
-
-    json += ",\"avail\":";           json += c.state.avail;
-    json += ",\"pulse\":";           json += (c.config.pulse ? "true" : "false");
-    json += ",\"state\":";           json += (c.state.state ? "true" : "false");
-    json += ",\"pulse_ms\":";        json += c.config.pulse_ms;
-    json += ",\"persist\":";         json += (c.config.persist ? "true" : "false");
-    json += ",\"fade\":";            json += c.config.fade;
-    json += ",\"type\":";            json += c.config.type;
-    json += ",\"local\":";           json += (c.runtime.local ? "true" : "false");
+    char obj[320];
+    char name[64];
+    jsonStringInto(name, sizeof(name), c.config.name);
+    int o = snprintf(obj, sizeof(obj),
+      "{\"id\":%lu,\"index\":%d,\"device_uid\":%lu,\"name\":\"%s\",\"value\":%s",
+      (unsigned long)c.identity.entity_id, i,
+      (unsigned long)(c.runtime.local ? GET_CHIP_ID() : c.identity.device_id),
+      name, buf);
+    if (o > 0) {
+      char fb[24];
+      dtostrf(isnan(c.config.correction) || isinf(c.config.correction)
+                ? 0.0f : c.config.correction, 0, 4, fb);
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"correction\":%s", fb);
+    }
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"avail\":%d", (int)c.state.avail);
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"pulse\":%s", c.config.pulse ? "true" : "false");
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"state\":%s", c.state.state ? "true" : "false");
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"pulse_ms\":%lu", (unsigned long)c.config.pulse_ms);
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"persist\":%s", c.config.persist ? "true" : "false");
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"fade\":%lu", (unsigned long)c.config.fade);
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"type\":%d", (int)c.config.type);
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"local\":%s", c.runtime.local ? "true" : "false");
     // Elapsed ms since the last remote packet, computed server-side from the
     // same millis() timebase as NET_TIMEOUT (client Date.now() is epoch-based
     // and cannot be compared directly with the device uptime counter).
-    json += ",\"age_ms\":";          json += (uint32_t)(millis() - c.state.last_update);
+    if (o > 0)
+      o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"age_ms\":%lu",
+                    (unsigned long)(millis() - c.state.last_update));
 
-    json += ",\"ip\":\"";
-    if (c.runtime.local) {
-      IPAddress ip = WiFi.localIP();
-      char ipbuf[16];
-      snprintf(ipbuf, sizeof(ipbuf), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-      json += ipbuf;
-    } else {
-      json += c.runtime.device_ip;
+    if (o > 0) {
+      if (c.runtime.local) {
+        IPAddress ip = WiFi.localIP();
+        char ipbuf[16];
+        snprintf(ipbuf, sizeof(ipbuf), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+        o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"ip\":\"%s\"}", ipbuf);
+      } else {
+        char ipesc[32];
+        jsonStringInto(ipesc, sizeof(ipesc), c.runtime.device_ip);
+        o += snprintf(obj + o, (int)sizeof(obj) - o, ",\"ip\":\"%s\"}", ipesc);
+      }
     }
-    json += "\"}";
+    if (o > 0) server.sendContent(String(obj));
   }
-  json += ']';
-  server.send(200, "application/json", json);
+  server.sendContent_P(PSTR("]"));
+  server.sendContent("");
 }
 
 ICACHE_FLASH_ATTR void handleCalibSet() {

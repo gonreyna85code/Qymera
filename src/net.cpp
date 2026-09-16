@@ -149,8 +149,11 @@ static void parseV2Frame(const uint8_t *buf, uint16_t len, const char *remote_ip
     case MsgType::HELLO: {
       const HelloPayload *hp = asHello(payload_ptr, payload_len);
       if (hp) {
-        logger::coref("V2 HELLO from %08X caps=%04X", env.src_uid, hp->capabilities);
-        // Could trigger capability negotiation here
+        // Serial-only (never GUI/log ring): peers announce V2 HELLO every
+        // BROADCAST_INTERVAL and every pair would flood the end-user log
+        // buffer. Serial is the developer layer; keep it fully informative.
+        logger::serialf(logger::CORE, logger::INFO, "V2 HELLO from %08X caps=%04X",
+                        env.src_uid, hp->capabilities);
       }
       break;
     }

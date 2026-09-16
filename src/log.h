@@ -73,7 +73,10 @@ void errorf(const char *fmt, ...);
 void logRemote(Layer layer, Level level, const char *msg);
 
 // ================= GUI ACCESS =================
-String getRecentLogsJson();
+// Stream recent logs as a JSON array without building a giant String (the
+// ESP8266 web server cannot build large Strings under heap pressure).
+typedef void (*LogJsonSink)(const char *chunk);
+void streamRecentLogsJson(LogJsonSink sink);
 void clearBuffer();
 
 }  // namespace logger

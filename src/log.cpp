@@ -215,8 +215,8 @@ void errorf(const char *fmt, ...) {
 
 // ================= GUI ACCESS =================
 
-String getRecentLogsJson() {
-  String json = "[";
+void streamRecentLogsJson(LogJsonSink sink) {
+  char buf[2 * MAX_LOG_MSG + 64];
   bool first = true;
 
   for (uint8_t layer = 0; layer < 3; layer++) {
@@ -227,26 +227,26 @@ String getRecentLogsJson() {
     for (uint8_t i = 0; i < buffer_count[layer]; i++) {
       uint8_t idx = (start + i) % LOG_BUFFER_SIZE;
       const LogEntry &e = buffers[layer][idx];
-      if (!first) json += ",";
-      first = false;
-      json += "{\"t\":";
-      json += e.timestamp;
-      json += ",\"l\":\"";
-      json += layer_name((Layer)layer);
-      json += "\",\"v\":\"";
-      json += level_name(e.level);
-      json += "\",\"m\":\"";
-      for (const char *p = e.message; *p; p++) {
-        if (*p == '"') json += "\\\"";
-        else if (*p == '\\') json += "\\\\";
-        else if (*p == '\n') json += "\\n";
-        else json += *p;
+
+      // Escape the message into a bounded buffer (worst case 2x + NUL).
+      char esc[2 * MAX_LOG_MSG];
+      const char *p = e.message;
+      char *q = esc;
+      for (; *p && q < esc + sizeof(esc) - 1; p++) {
+        if (*p == '"')      { *q++ = '\\'; *q++ = '"'; }
+        else if (*p == '\\'){ *q++ = '\\'; *q++ = '\\'; }
+        else if (*p == '\n'){ *q++ = '\\'; *q++ = 'n'; }
+        else if (*p >= 0x20){ *q++ = *p; }
       }
-      json += "\"}";
+      *q = '\0';
+
+      int n = snprintf(buf, sizeof(buf), "%s{\"t\":%lu,\"l\":\"%s\",\"v\":\"%s\",\"m\":\"%s\"}",
+                       first ? "" : ",", (unsigned long)e.timestamp,
+                       layer_name((Layer)layer), level_name(e.level), esc);
+      first = false;
+      if (n > 0) sink(buf);
     }
   }
-  json += "]";
-  return json;
 }
 
 void clearBuffer() {
