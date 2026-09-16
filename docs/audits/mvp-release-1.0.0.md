@@ -130,3 +130,19 @@ factory-reset hw test, extra ESP32-family boards) and the optional
 | `.github/workflows/release.yml` | NEW — release pipeline |
 | `scripts/ci_release.py` | NEW — assets + manifest packaging |
 | `.gitignore` | + `/dist` |
+
+## Post-release Hotfix: UDP TX crash (2026-09-15)
+
+Hardware soak on ESP32 (COM3) exposed a boot-loop: `StoreProhibited` panic,
+EXCVADDR 0x00000000, right after `WiFi connecting` (backtrace: `logger::coref`
+→ `net::sendLog` → `transport::broadcast` → `WiFiUDP::write`). Root cause: on
+ESP32, `WiFiUDP::beginPacket()` during a STA join (netif mid-reinit on
+`WiFi.begin`) returns without allocating its tx buffer, and the following
+`write()` memcpy's into address 0. The old `udpTxReady()` guard (mode != NULL)
+was insufficient — mode is already STA while joining.
+
+Fix (transport.cpp): broadcast()/unicast() now gate UDP TX on a usable link
+(`WiFi.status()==WL_CONNECTED` or AP mode); ESP8266 path unchanged. Verified on
+hardware: boot → join MATTER_NET → `WiFi connected, IP` → transport UDP,
+0 panics. Note: the previously recorded 'intermittent board / crash-loop after
+WiFi' was this bug, not a hardware fault.
