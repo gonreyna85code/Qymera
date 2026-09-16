@@ -20,6 +20,12 @@ static uint8_t espnow_buf[ESP_NOW_FRAME_MAX];
 
 static bool udpTxReady() {
 #if defined(ESP32)
+  // A socket opened while STA is still joining (netif mid-reinit on
+  // WiFi.begin/reconnect) has no usable TX path: beginPacket() fails, the tx
+  // buffer stays NULL and write() crashes writing to address 0. Only emit over
+  // UDP once the link is up, or from the (always-ready) AP interface.
+  wl_status_t st = WiFi.status();
+  if (st != WL_CONNECTED && !(WiFi.getMode() & WIFI_AP)) return false;
   return WiFi.getMode() != WIFI_MODE_NULL;
 #else
   return true;
@@ -65,6 +71,7 @@ bool unicast(const char *peer_address, const uint8_t *data, uint16_t len) {
   if (!peer_address || !data || len == 0 || len > FRAME_MAX) return false;
 
   if (active_kind == Kind::UDP) {
+    if (!udpTxReady()) return false;
     command_socket.beginPacket(peer_address, command_port);
     command_socket.write(data, len);
     command_socket.endPacket();
