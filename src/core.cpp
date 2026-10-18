@@ -127,7 +127,7 @@ static void checkWiFiStatus() {
       web_initialized = true;
     }
     logger::coref("WiFi connected, IP:%s", WiFi.localIP().toString().c_str());
-  } else if (millis() - wifi_connect_start >= 15000) {
+  } else if (millis() - wifi_connect_start >= 30000) {
     wifi_connecting = false;
     startAP();
     logger::warnf("WiFi timeout, starting AP '%s'", AP_SSID);
