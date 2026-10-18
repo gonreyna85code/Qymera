@@ -100,6 +100,8 @@ static void startWiFi() {
     return;
   }
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid.c_str(), password.c_str());
   SET_AUTO_CONNECT();
   SET_WIFI_SLEEP();
@@ -200,15 +202,18 @@ void begin() {
   // loop() iteration, right after the first report(): entities are only
   // registered at that point, so persisted min/max/correction/persist/
   // pers_state/fade/pulse can be matched by UID and restored.
-  sensors::init();
-  Qymera::init();
-  automations::init();
-
   // Phase 2: Network startup
   // Network-dependent services (net, web, OTA) are initialized only when
   // WiFi is connected (in checkWiFiStatus()) or in AP mode (in startAP())
   // This prevents xQueueSemaphoreTake assert on ESP32 boot
   startWiFi();
+
+  // Phase 1: Local subsystem initialization (no WiFi dependency)
+  // Init sensors AFTER WiFi stack has been kicked off to give the radio more
+  // time to associate before the sensor subsystem competes for CPU/heap.
+  sensors::init();
+  Qymera::init();
+  automations::init();
 
   logger::coref("Free heap: %u B", ESP.getFreeHeap());
 }
