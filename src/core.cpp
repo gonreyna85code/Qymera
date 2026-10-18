@@ -12,6 +12,7 @@
 #include "storage.h"
 #include "firmware.h"
 #include "log.h"
+#include "screen.h"
 
 namespace core {
 
@@ -278,6 +279,9 @@ void loop() {
 
   /// Si no hay red, usar ESP-NOW; si hay red, usar UDP
   net::setTransport(wifi_connected ? net::TRANSPORT_UDP : net::TRANSPORT_ESPNOW);
+
+  // Screen tick (deferred init + redraw, non-blocking)
+  screen::tick(millis());
 
   /// 4) Primera iteración: reporte inicial + carga de configuración persistente.
   //     Los estados persistentes se aplican justo después del primer reporte

@@ -23,6 +23,7 @@
 #include "web.h"
 #include "automations.h"
 #include "log.h"
+#include "screen.h"
 
 // ================= PUBLIC FACADE =================
 // Simplifies main.ino usage: sensors, actuators, lifecycle and serial control
@@ -49,6 +50,10 @@ inline void relay(const String &key, uint8_t pin, bool inverted = false)
                                                        { sensors::relay(key, pin, inverted); }
 inline void dimmer(const String &key, uint8_t pin, bool inverted = false)
                                                        { sensors::dimmer(key, pin, inverted); }
+
+// ---- display (I2C) ----
+inline void screen(uint16_t width, uint16_t height, uint8_t sda, uint8_t scl)
+                                                       { ::screen::init(width, height, sda, scl); }
 
 // ---- control ----
 inline void setRelay(const String &key, bool target)  { sensors::setRelay(key, target); }

@@ -1,0 +1,362 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include "screen.h"
+#include "config.h"
+#include "entities.h"
+#include "model.h"
+using namespace qymera::model;
+#include "core.h"
+#include "net.h"
+
+namespace screen {
+
+static uint16_t W = 0, H = 0;
+static uint8_t SDA = 0, SCL = 0;
+static bool initialised = false;
+static bool init_pending = false;
+static uint32_t init_due_ms = 0;
+static uint32_t last_redraw_ms = 0;
+static uint8_t anim_phase = 0;
+static uint8_t *fb = nullptr;
+static uint16_t fb_bytes = 0;
+static int scroll_offset = 0;
+static uint32_t last_scroll_ms = 0;
+
+static const uint8_t FONT5x7[][5] PROGMEM = {
+  {0x00,0x00,0x00,0x00,0x00},
+  {0x00,0x00,0x5F,0x00,0x00},
+  {0x00,0x07,0x00,0x07,0x00},
+  {0x14,0x7F,0x14,0x7F,0x14},
+  {0x24,0x2A,0x7F,0x2A,0x12},
+  {0x23,0x13,0x08,0x64,0x62},
+  {0x36,0x49,0x55,0x22,0x50},
+  {0x00,0x05,0x03,0x00,0x00},
+  {0x00,0x1C,0x22,0x41,0x00},
+  {0x00,0x41,0x22,0x1C,0x00},
+  {0x14,0x08,0x3E,0x08,0x14},
+  {0x08,0x08,0x3E,0x08,0x08},
+  {0x00,0x50,0x30,0x00,0x00},
+  {0x08,0x08,0x08,0x08,0x08},
+  {0x00,0x60,0x60,0x00,0x00},
+  {0x20,0x10,0x08,0x04,0x02},
+  {0x3E,0x51,0x49,0x45,0x3E},
+  {0x00,0x42,0x7F,0x40,0x00},
+  {0x42,0x61,0x51,0x49,0x46},
+  {0x21,0x41,0x45,0x4B,0x31},
+  {0x18,0x14,0x12,0x7F,0x10},
+  {0x27,0x45,0x45,0x45,0x39},
+  {0x3C,0x4A,0x49,0x49,0x30},
+  {0x01,0x71,0x09,0x05,0x03},
+  {0x36,0x49,0x49,0x49,0x36},
+  {0x06,0x49,0x49,0x29,0x1E},
+  {0x00,0x36,0x36,0x00,0x00},
+  {0x00,0x56,0x36,0x00,0x00},
+  {0x08,0x14,0x22,0x41,0x00},
+  {0x14,0x14,0x14,0x14,0x14},
+  {0x41,0x22,0x14,0x08,0x00},
+  {0x02,0x01,0x51,0x09,0x06},
+  {0x32,0x49,0x79,0x41,0x3E},
+  {0x7E,0x11,0x11,0x11,0x7E},
+  {0x7F,0x49,0x49,0x49,0x36},
+  {0x3E,0x41,0x41,0x41,0x22},
+  {0x7F,0x41,0x41,0x22,0x1C},
+  {0x7F,0x49,0x49,0x49,0x41},
+  {0x7F,0x09,0x09,0x09,0x01},
+  {0x3E,0x41,0x49,0x49,0x7A},
+  {0x7F,0x08,0x08,0x08,0x7F},
+  {0x00,0x41,0x7F,0x41,0x00},
+  {0x20,0x40,0x41,0x3F,0x01},
+  {0x7F,0x08,0x14,0x22,0x41},
+  {0x7F,0x40,0x40,0x40,0x40},
+  {0x7F,0x02,0x0C,0x02,0x7F},
+  {0x7F,0x04,0x08,0x10,0x7F},
+  {0x3E,0x41,0x41,0x41,0x3E},
+  {0x7F,0x09,0x09,0x09,0x06},
+  {0x3E,0x41,0x51,0x21,0x5E},
+  {0x7F,0x09,0x19,0x29,0x46},
+  {0x46,0x49,0x49,0x49,0x31},
+  {0x01,0x01,0x7F,0x01,0x01},
+  {0x3F,0x40,0x40,0x40,0x3F},
+  {0x1F,0x20,0x40,0x20,0x1F},
+  {0x3F,0x40,0x38,0x40,0x3F},
+  {0x63,0x14,0x08,0x14,0x63},
+  {0x07,0x08,0x70,0x08,0x07},
+  {0x61,0x51,0x49,0x45,0x43},
+  {0x00,0x7F,0x41,0x41,0x00},
+  {0x02,0x04,0x08,0x10,0x20},
+  {0x00,0x41,0x41,0x7F,0x00},
+  {0x04,0x02,0x01,0x02,0x04},
+  {0x40,0x40,0x40,0x40,0x40},
+  {0x00,0x01,0x02,0x04,0x00},
+  {0x20,0x54,0x54,0x54,0x78},
+  {0x7F,0x48,0x44,0x44,0x38},
+  {0x38,0x44,0x44,0x44,0x20},
+  {0x38,0x44,0x44,0x48,0x7F},
+  {0x38,0x54,0x54,0x54,0x18},
+  {0x08,0x7E,0x09,0x01,0x02},
+  {0x0C,0x52,0x52,0x52,0x3E},
+  {0x7F,0x08,0x04,0x04,0x78},
+  {0x00,0x44,0x7D,0x40,0x00},
+  {0x20,0x40,0x44,0x3D,0x00},
+  {0x7F,0x10,0x28,0x44,0x00},
+  {0x00,0x41,0x7F,0x40,0x00},
+  {0x7C,0x04,0x18,0x04,0x78},
+  {0x7C,0x08,0x04,0x04,0x78},
+  {0x38,0x44,0x44,0x44,0x38},
+  {0x7C,0x14,0x14,0x14,0x08},
+  {0x08,0x14,0x14,0x18,0x7C},
+  {0x7C,0x08,0x04,0x04,0x08},
+  {0x48,0x54,0x54,0x54,0x20},
+  {0x04,0x3F,0x44,0x40,0x20},
+  {0x3C,0x40,0x40,0x20,0x7C},
+  {0x1C,0x20,0x40,0x20,0x1C},
+  {0x3C,0x40,0x30,0x40,0x3C},
+  {0x44,0x28,0x10,0x28,0x44},
+  {0x0C,0x50,0x50,0x50,0x3C},
+  {0x44,0x64,0x54,0x4C,0x44},
+  {0x00,0x08,0x36,0x41,0x00},
+  {0x00,0x00,0x7F,0x00,0x00},
+  {0x00,0x41,0x36,0x08,0x00},
+  {0x10,0x08,0x08,0x10,0x08},
+};
+
+static void i2cCmd(uint8_t c) {
+  Wire.beginTransmission(0x3C);
+  Wire.write(0x00);
+  Wire.write(c);
+  Wire.endTransmission();
+}
+
+static void i2cData(const uint8_t *d, uint16_t n) {
+  Wire.beginTransmission(0x3C);
+  Wire.write(0x40);
+  for (uint16_t i = 0; i < n; i++) Wire.write(d[i]);
+  Wire.endTransmission();
+}
+
+static bool probe(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+static void fbClear() {
+  if (!fb) return;
+  memset(fb, 0, fb_bytes);
+}
+
+static void fbSet(int x, int y, bool on) {
+  if (x < 0 || y < 0 || x >= (int)W || y >= (int)H) return;
+  uint16_t idx = (y >> 3) * W + x;
+  if (on) fb[idx] |= (1 << (y & 7));
+  else    fb[idx] &= ~(1 << (y & 7));
+}
+
+static void fbHLine(int x, int y, int w, bool on) {
+  for (int i = 0; i < w; i++) fbSet(x + i, y, on);
+}
+static void fbVLine(int x, int y, int h, bool on) {
+  for (int i = 0; i < h; i++) fbSet(x, y + i, on);
+}
+static void fbRect(int x, int y, int w, int h, bool on) {
+  fbHLine(x, y, w, on);
+  fbHLine(x, y + h - 1, w, on);
+  fbVLine(x, y, h, on);
+  fbVLine(x + w - 1, y, h, on);
+}
+static void fbFillRect(int x, int y, int w, int h, bool on) {
+  for (int yy = y; yy < y + h; yy++)
+    for (int xx = x; xx < x + w; xx++) fbSet(xx, yy, on);
+}
+
+static void fbText(int x, int y, const char *s, uint8_t scale) {
+  int cx = x;
+  while (*s) {
+    uint8_t c = (uint8_t)*s++;
+    if (c < 32 || c > 126) c = 32;
+    const uint8_t *g = &FONT5x7[c - 32][0];
+    for (uint8_t col = 0; col < 5; col++) {
+      uint8_t bits = pgm_read_byte(g + col);
+      for (uint8_t row = 0; row < 7; row++) {
+        if (bits & (1 << row)) {
+          for (uint8_t sx = 0; sx < scale; sx++)
+            for (uint8_t sy = 0; sy < scale; sy++)
+              fbSet(cx + col * scale + sx, y + row * scale + sy, true);
+        }
+      }
+    }
+    cx += 6 * scale;
+    if (cx > (int)W) break;
+  }
+}
+
+static void fbCenterText(int y, const char *s, uint8_t scale) {
+  int w = (int)strlen(s) * 6 * scale;
+  int x = ((int)W - w) / 2;
+  if (x < 0) x = 0;
+  fbText(x, y, s, scale);
+}
+
+static bool panelInit() {
+  if (!probe(0x3C) && !probe(0x3D)) return false;
+  i2cCmd(0xAE);
+  i2cCmd(0x20); i2cCmd(0x00);
+  i2cCmd(0xB0);
+  i2cCmd(0xC8);
+  i2cCmd(0x00);
+  i2cCmd(0x10);
+  i2cCmd(0x40);
+  i2cCmd(0x81); i2cCmd(0x7F);
+  i2cCmd(0xA1);
+  i2cCmd(0xA6);
+  i2cCmd(0xA8); i2cCmd(H - 1);
+  i2cCmd(0xD3); i2cCmd(0x00);
+  i2cCmd(0xD5); i2cCmd(0x80);
+  i2cCmd(0xD9); i2cCmd(0xF1);
+  i2cCmd(0xDA); i2cCmd((H == 32) ? 0x02 : 0x12);
+  i2cCmd(0xDB); i2cCmd(0x40);
+  i2cCmd(0x8D); i2cCmd(0x14);
+  i2cCmd(0xAF);
+  return true;
+}
+
+static void panelFlush() {
+  i2cCmd(0x21); i2cCmd(0); i2cCmd(W - 1);
+  i2cCmd(0x22); i2cCmd(0); i2cCmd((H / 8) - 1);
+  for (uint16_t i = 0; i < fb_bytes; i += 16) {
+    uint8_t n = (i + 16 <= fb_bytes) ? 16 : (fb_bytes - i);
+    i2cData(fb + i, n);
+  }
+}
+
+static void drawSplash() {
+  fbClear();
+  fbRect(0, 0, W, H, true);
+  uint8_t titleScale = (W >= 128) ? 2 : 1;
+  int titleY = (H / 2) - (7 * titleScale) - 6;
+  if (titleY < 4) titleY = 4;
+  fbCenterText(titleY, "QYMERA", titleScale);
+  const char *tag = "local-first automation";
+  int tagY = titleY + 7 * titleScale + 4;
+  fbCenterText(tagY, tag, 1);
+  int divY = tagY + 10;
+  if (divY < H - 12) fbHLine(8, divY, W - 16, true);
+  char foot[40];
+  if (core::is_connected()) {
+    IPAddress ip = WiFi.localIP();
+    snprintf(foot, sizeof(foot), "IP %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  } else {
+    strcpy(foot, "MESH / ESP-NOW");
+  }
+  fbCenterText(H - 10, foot, 1);
+  int scanY = (anim_phase * 3) % (H - 4) + 2;
+  fbHLine(2, scanY, W - 4, true);
+  panelFlush();
+}
+
+static void drawEntities() {
+  fbClear();
+  fbRect(0, 0, W, H, true);
+  fbText(2, 2, "ENTITIES", 1);
+  char hdr[24];
+  snprintf(hdr, sizeof(hdr), "%u/%u", (unsigned)entities::localCount(),
+           (unsigned)entities::capacity());
+  fbText(W - (int)strlen(hdr) * 6 - 2, 2, hdr, 1);
+  fbHLine(1, 11, W - 2, true);
+  uint8_t lines = (H - 14) / 9;
+  if (lines < 1) lines = 1;
+  uint8_t row = 0;
+  for (uint8_t i = 0; i < entities::capacity() && row < lines; i++) {
+    if (!entities::isUsed(i)) continue;
+    if (i < (uint8_t)scroll_offset) continue;
+    const Entity &e = entities::peek(i);
+    char glyph = e.state.state ? '*' : 'o';
+    char line[40];
+    snprintf(line, sizeof(line), "%c %s", glyph, e.config.name);
+    fbText(2, 13 + row * 9, line, 1);
+    if (e.config.type != ::TYPE_RELAY && e.config.type != ::TYPE_DIMMER) {
+      char vbuf[12];
+      snprintf(vbuf, sizeof(vbuf), "%.1f", e.state.value);
+      int vx = W - (int)strlen(vbuf) * 6 - 2;
+      fbText(vx, 13 + row * 9, vbuf, 1);
+    }
+    row++;
+  }
+  char foot[40];
+  if (core::is_connected()) {
+    IPAddress ip = WiFi.localIP();
+    snprintf(foot, sizeof(foot), "IP %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  } else {
+    strcpy(foot, "MESH / ESP-NOW");
+  }
+  fbCenterText(H - 9, foot, 1);
+  if ((millis() / 500) & 1) fbSet(W - 2, H - 2, true);
+  panelFlush();
+}
+
+void init(uint16_t width, uint16_t height, uint8_t sda, uint8_t scl) {
+  W = width;
+  H = height;
+  SDA = sda;
+  SCL = scl;
+  fb_bytes = (W * H) / 8;
+  if (fb) free(fb);
+  fb = (uint8_t *)malloc(fb_bytes);
+  if (!fb) {
+    fb_bytes = 0;
+    return;
+  }
+  memset(fb, 0, fb_bytes);
+  init_pending = true;
+  init_due_ms = millis() + 30000;
+}
+
+void tick(uint32_t now_ms) {
+  if (!fb) return;
+  if (init_pending && !initialised) {
+    if ((int32_t)(now_ms - init_due_ms) >= 0) {
+      Wire.begin(SDA, SCL);
+      Wire.setClock(400000);
+      if (panelInit()) {
+        initialised = true;
+        init_pending = false;
+        last_redraw_ms = now_ms;
+        drawSplash();
+      } else {
+        init_due_ms = now_ms + 5000;
+      }
+    }
+    return;
+  }
+  if (!initialised) return;
+  if (now_ms - last_scroll_ms >= 1500) {
+    last_scroll_ms = now_ms;
+    int used = 0;
+    for (uint8_t i = 0; i < entities::capacity(); i++)
+      if (entities::isUsed(i)) used++;
+    uint8_t lines = (H - 14) / 9;
+    if (lines < 1) lines = 1;
+    if (used > lines) {
+      scroll_offset++;
+      if (scroll_offset > used - lines) scroll_offset = 0;
+    } else {
+      scroll_offset = 0;
+    }
+  }
+  if (now_ms - last_redraw_ms >= 250) {
+    last_redraw_ms = now_ms;
+    anim_phase++;
+    if ((now_ms / 6000) & 1) drawSplash();
+    else drawEntities();
+  }
+}
+
+void redraw() {
+  if (!initialised) return;
+  last_redraw_ms = 0;
+}
+
+bool ready() { return initialised; }
+uint16_t width() { return W; }
+uint16_t height() { return H; }
+
+}  // namespace screen
