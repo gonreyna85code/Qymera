@@ -99,9 +99,9 @@ static void startWiFi() {
     startAP();
     return;
   }
-  WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), password.c_str());
   SET_AUTO_CONNECT();
   SET_WIFI_SLEEP();
