@@ -262,7 +262,7 @@ static void drawEntities() {
            (unsigned)entities::capacity());
   fbText(W - (int)strlen(hdr) * 6 - 2, 2, hdr, 1);
   fbHLine(1, 11, W - 2, true);
-  uint8_t lines = (H - 14) / 9;
+  uint8_t lines = (H - 12) / 8;
   if (lines < 1) lines = 1;
   uint8_t row = 0;
   for (uint8_t i = 0; i < entities::capacity() && row < lines; i++) {
@@ -272,12 +272,12 @@ static void drawEntities() {
     char glyph = e.state.state ? '*' : 'o';
     char line[40];
     snprintf(line, sizeof(line), "%c %s", glyph, e.config.name);
-    fbText(2, 13 + row * 9, line, 1);
+    fbText(2, 12 + row * 8, line, 1);
     if (e.config.type != ::TYPE_RELAY && e.config.type != ::TYPE_DIMMER) {
       char vbuf[12];
       snprintf(vbuf, sizeof(vbuf), "%.1f", e.state.value);
       int vx = W - (int)strlen(vbuf) * 6 - 2;
-      fbText(vx, 13 + row * 9, vbuf, 1);
+      fbText(vx, 12 + row * 8, vbuf, 1);
     }
     row++;
   }
@@ -333,7 +333,7 @@ void tick(uint32_t now_ms) {
     int used = 0;
     for (uint8_t i = 0; i < entities::capacity(); i++)
       if (entities::isUsed(i)) used++;
-    uint8_t lines = (H - 14) / 9;
+    uint8_t lines = (H - 12) / 8;
     if (lines < 1) lines = 1;
     if (used > lines) {
       scroll_offset++;
