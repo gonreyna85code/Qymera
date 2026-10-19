@@ -14,6 +14,22 @@
 #include "log.h"
 #include "screen.h"
 
+
+// WiFi/Boot state machine
+enum class WifiState : uint8_t {
+  INIT,
+  STA_CONNECTING,
+  STA_CONNECTED,
+  AP_FALLBACK,
+  STA_DISCONNECTED_RETRY
+};
+static WifiState wifi_state = WifiState::INIT;
+static bool network_stack_ready = false;
+static uint8_t last_disconnect_reason = 0;
+static uint8_t last_logged_reason = 0;
+static bool udp_web_net_inited = false;
+
+
 namespace core {
 
 // Flags to ensure network-dependent services are initialized exactly once,
@@ -32,6 +48,7 @@ static bool wifi_connected = false;
 static bool wifi_connecting = false;
 static unsigned long wifi_connect_start = 0;
 static unsigned long last_attempt = 0;
+static unsigned long last_disconnect_time = 0;
 static unsigned long last_report = 0;
 static bool first_report = true;
 GeneralSettings genset;
@@ -40,24 +57,34 @@ GeneralSettings genset;
 
  /// Reanuda el servidor hotspot en modo AP tras una conexión WiFi fallida.
 static void startOtaService();
+static void ensureNetworkStack();
 static void startAP() {
+  ensureNetworkStack();
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID);
   wifi_connected = false;
   wifi_connecting = false;
-  if (!web_initialized) {
-    web::init();
-    web_initialized = true;
-  }
-  web::server.close();
-  delay(50);
-  web::server.begin();
-  if (!net_initialized) {
-    net::init();
-    net_initialized = true;
+  // Init network-dependent services once
+  if (!udp_web_net_inited) {
+    if (!web_initialized) {
+      web::init();
+      web_initialized = true;
+    }
+    // web::init() already calls server.begin() in current codebase; avoid double close/begin
+    if (!net_initialized) {
+      net::init();
+      net_initialized = true;
+    }
+    udp_web_net_inited = true;
+  } else {
+    // Ensure server is running if web was init before
+    if (web_initialized) {
+      // Don't close/reopen unnecessarily; just ensure begin not called twice (init already did)
+    }
   }
   startOtaService();
-  logger::coref("AP mode '%s' started", AP_SSID);
+  wifi_state = WifiState::AP_FALLBACK;
+  logger::coref("AP mode '%s' started (IP:%s)", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 /// Single controlled OTA initialization path.
@@ -86,28 +113,40 @@ static void startOtaService() {
 }
 
 /// kicks off a non-blocking WiFi connection attempt.
-/// WiFi status is polled from loop() via checkWiFiStatus().
+static void ensureNetworkStack() {
+#if defined(ESP32)
+  if (!network_stack_ready) {
+    esp_netif_init();
+    // esp_event_loop_create_default may return ESP_ERR_INVALID_STATE if already exists
+    esp_err_t err = esp_event_loop_create_default();
+    (void)err;
+    network_stack_ready = true;
+  }
+#endif
+}
 
 static void startWiFi() {
-  // Initialize ESP32 network interface layer (required before WiFi/EWiFi on ESP32)
-  // Fixes: xQueueSemaphoreTake assert (queue.c:1709) on ESP32 boot
-#if defined(ESP32)
-  esp_netif_init();
-  esp_event_loop_create_default();
-#endif
-
-  if (ssid == "") {
+  ensureNetworkStack();
+  if (ssid.isEmpty() || ssid.length() == 0) {
+    wifi_state = WifiState::AP_FALLBACK;
     startAP();
     return;
   }
-  WiFi.persistent(true);
-  WiFi.setAutoReconnect(true);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
+  // Do not destroy existing AP if already in AP fallback; require explicit reset/path
+  if (wifi_state == WifiState::AP_FALLBACK) {
+    // Avoid flipping modes while AP is serving config; try to keep AP stable
+    logger::core("AP fallback active - refusing to switch to STA without reset/new creds");
+    return;
+  }
+  WiFi.persistent(false); // we manage credentials in our storage
   SET_AUTO_CONNECT();
   SET_WIFI_SLEEP();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
   wifi_connecting = true;
   wifi_connect_start = millis();
+  wifi_state = WifiState::STA_CONNECTING;
+  last_attempt = millis();
   logger::coref("WiFi connecting to %s", ssid.c_str());
 }
 
@@ -147,21 +186,57 @@ static void setupWiFiEvents() {
   if (events_setup) return;
   events_setup = true;
 #if defined(ESP32)
-  WiFi.onEvent([](WiFiEvent_t e) {
+  // Callbacks run outside loop(): only latch state + reason, no I2C, no
+  // server start, no radio restart. Reason codes: 200=BEACON_TIMEOUT (AP
+  // ausente), 15=AUTH_FAIL, 201=NO_AP_FOUND, 4=HANDSHAKE_TIMEOUT (clave
+  // mala), 8=DHCP_FAIL. En Arduino-ESP32 2.0.x el motivo viaja en el
+  // overload con WiFiEventInfo_t.
+  WiFi.onEvent([](arduino_event_id_t e, WiFiEventInfo_t info) {
     if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
       wifi_connected = false;
+      if (wifi_state == WifiState::STA_CONNECTED) {
+        wifi_state = WifiState::STA_DISCONNECTED_RETRY;
+        last_disconnect_time = millis();
+      }
+      last_disconnect_reason = info.wifi_sta_disconnected.reason;
+      // Dedup: only log when the reason changes (avoid event storms).
+      if (last_logged_reason != last_disconnect_reason) {
+        last_logged_reason = last_disconnect_reason;
+        logger::warnf("STA disconnected reason=%u state=%d",
+                      (unsigned)last_disconnect_reason, (int)wifi_state);
+      }
     } else if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-      // Keep wifi_connecting untouched: on the first connect the polling in
-      // checkWiFiStatus() must still run to initialize deferred services.
       wifi_connected = true;
+      if (wifi_state == WifiState::STA_CONNECTING) {
+        wifi_state = WifiState::STA_CONNECTED;
+      }
+      last_logged_reason = 0;
     }
   });
 #else
   // Handlers must be kept alive (stored) or ESP8266 deregisters them.
   static WiFiEventHandler on_disc = WiFi.onStationModeDisconnected(
-    [](const WiFiEventStationModeDisconnected &) { wifi_connected = false; });
+    [](const WiFiEventStationModeDisconnected &e) {
+      wifi_connected = false;
+      if (wifi_state == WifiState::STA_CONNECTED) {
+        wifi_state = WifiState::STA_DISCONNECTED_RETRY;
+        last_disconnect_time = millis();
+      }
+      last_disconnect_reason = (uint8_t)e.reason;
+      if (last_logged_reason != last_disconnect_reason) {
+        last_logged_reason = last_disconnect_reason;
+        logger::warnf("STA disconnected reason=%u state=%d",
+                      (unsigned)last_disconnect_reason, (int)wifi_state);
+      }
+    });
   static WiFiEventHandler on_got = WiFi.onStationModeGotIP(
-    [](const WiFiEventStationModeGotIP &) { wifi_connected = true; });
+    [](const WiFiEventStationModeGotIP &) {
+      wifi_connected = true;
+      if (wifi_state == WifiState::STA_CONNECTING) {
+        wifi_state = WifiState::STA_CONNECTED;
+      }
+      last_logged_reason = 0;
+    });
 #endif
 }
 
@@ -174,12 +249,12 @@ void begin() {
   Serial.println("BOOT QYMERA");
   uid = String(GET_CHIP_ID(), HEX);
   logger::init();
-  logger::core("Boot");
+  logger::core("Boot: phase=begin");
   logger::coref("Qymera %s (%s) - chip %s", QYMERA_VERSION_STRING, QYMERA_CHANNEL, uid.c_str());
   storage::loadCredentials(ssid, password);
-  logger::core("Credentials loaded");
+  logger::coref("Boot: creds loaded ssid=%s", ssid.c_str());
   storage::loadGeneralSettings(genset.broadcast_port, genset.command_port, genset.report_interval);
-  logger::core("Settings loaded");
+  logger::core("Boot: settings loaded");
 
   setupWiFiEvents();
 
@@ -207,16 +282,19 @@ void begin() {
   // Network-dependent services (net, web, OTA) are initialized only when
   // WiFi is connected (in checkWiFiStatus()) or in AP mode (in startAP())
   // This prevents xQueueSemaphoreTake assert on ESP32 boot
+  logger::core("Boot: starting WiFi");
   startWiFi();
 
   // Phase 1: Local subsystem initialization (no WiFi dependency)
-  // Init sensors AFTER WiFi stack has been kicked off to give the radio more
-  // time to associate before the sensor subsystem competes for CPU/heap.
   sensors::init();
+  logger::core("Boot: sensors initialized");
   Qymera::init();
+  logger::core("Boot: user init complete");
   automations::init();
+  logger::core("Boot: automations initialized");
 
-  logger::coref("Free heap: %u B", ESP.getFreeHeap());
+  logger::serialf(logger::CORE, logger::INFO, "boot: heap free=%u B", ESP.getFreeHeap());
+  logger::core("Boot: complete");
 }
 
 // ================= ACCESORIOS ===================
@@ -270,11 +348,17 @@ void loop() {
   /// 2b) Web OTA driver (manifest check / streaming firmware download).
   firmware::tick();
 
-  /// 3) Reconexion si perdimos WiFi y paso el timeout definido.
+  /// 3) Reconexion/backoff si perdimos WiFi tras haberlo tenido.
+  //    No reintentamos si estamos en AP fallback sin credenciales nuevas:
+  //    startWiFi() se abstiene de cambiar de modo mientras AP est� activo.
   if (!wifi_connected && !wifi_connecting &&
-      millis() - last_attempt > WIFI_RETRY_INTERVAL) {
-    last_attempt = millis();
-    startWiFi();
+      wifi_state != WifiState::AP_FALLBACK) {
+    unsigned long base = last_disconnect_time > 0 ? last_disconnect_time : last_attempt;
+    if (millis() - base > WIFI_RETRY_INTERVAL) {
+      last_attempt = millis();
+      last_disconnect_time = 0;
+      startWiFi();
+    }
   }
 
   /// Si no hay red, usar ESP-NOW; si hay red, usar UDP
@@ -284,6 +368,7 @@ void loop() {
   //     Los estados persistentes se aplican justo después del primer reporte
   //     (que registra las entidades) y ANTES de cualquier announce de net.
   if (first_report) {
+    unsigned long t0 = millis();
     Qymera::report();
     screen::tick(millis());
     sensors::ensureTimeRegistered();
@@ -291,6 +376,7 @@ void loop() {
     sensors::applyPersistedStates();
     first_report = false;
     last_report = millis();
+    logger::coref("Boot: first report done in %lu ms", millis()-t0);
   }
 
   /// 4) Tareas periódicas: clock NTP, net tick, automatización.

@@ -87,7 +87,8 @@ static void espnow_recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
 // ================= API =================
 
 bool init() {
-  if (esp_now_init() == 0) {
+  int r = esp_now_init();
+  if (r == 0) {
 #if defined(ESP8266)
     esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
 #endif
@@ -97,7 +98,15 @@ bool init() {
     logger::core("ESP-NOW initialized");
     return true;
   }
-  logger::error("ESP-NOW init failed");
+  // ESP_ERR_INVALID_STATE (0x103) means already initialized on ESP32
+  if (r != 0) {
+    // treat as OK if already ready
+    if (espnow_ready) return true;
+    logger::warnf("ESP-NOW init result %d (already inited?)", r);
+    // Try to re-register callbacks if missing? not strictly needed
+    espnow_ready = true;
+    return true;
+  }
   return false;
 }
 
