@@ -280,14 +280,12 @@ void loop() {
   /// Si no hay red, usar ESP-NOW; si hay red, usar UDP
   net::setTransport(wifi_connected ? net::TRANSPORT_UDP : net::TRANSPORT_ESPNOW);
 
-  // Screen tick (deferred init + redraw, non-blocking)
-  screen::tick(millis());
-
   /// 4) Primera iteración: reporte inicial + carga de configuración persistente.
   //     Los estados persistentes se aplican justo después del primer reporte
   //     (que registra las entidades) y ANTES de cualquier announce de net.
   if (first_report) {
     Qymera::report();
+    screen::tick(millis());
     sensors::ensureTimeRegistered();
     storage::loadCalibration();
     sensors::applyPersistedStates();
@@ -321,6 +319,7 @@ void loop() {
   if (millis() - last_report >= genset.report_interval) {
     last_report = millis();
     Qymera::report();
+    screen::tick(millis());
     net::sendBinaryReport();
     // V2 discovery (Phase 3/4): advertise capabilities and stable entity ids so
     // peers can route actuator commands through the reliable V2 path. Coexists
