@@ -304,7 +304,7 @@ static void drawEntities() {
     snprintf(line, sizeof(line), "%s", e.config.name);
     int max_chars = vx / 6;
     if (max_chars >= 1) {
-      if ((int)strlen(line) > max_chars) line[max_chars] = ' ';
+      if ((int)strlen(line) > max_chars) line[max_chars] = 0;
       fbText(0, ry, line, 1);
     }
     row++;
