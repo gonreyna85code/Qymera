@@ -198,24 +198,31 @@ static void fbCenterText(int y, const char *s, uint8_t scale) {
 
 static bool panelInit() {
   if (!probe(0x3C) && !probe(0x3D)) return false;
-  i2cCmd(0xAE);
-  i2cCmd(0x20); i2cCmd(0x00);
-  i2cCmd(0xB0);
-  i2cCmd(0xC8);
-  i2cCmd(0x00);
-  i2cCmd(0x10);
-  i2cCmd(0x40);
-  i2cCmd(0x81); i2cCmd(0x7F);
-  i2cCmd(0xA1);
-  i2cCmd(0xA6);
-  i2cCmd(0xA8); i2cCmd(H - 1);
-  i2cCmd(0xD3); i2cCmd(0x00);
-  i2cCmd(0xD5); i2cCmd(0x80);
-  i2cCmd(0xD9); i2cCmd(0xF1);
-  i2cCmd(0xDA); i2cCmd((H == 32) ? 0x12 : 0x12);
-  i2cCmd(0xDB); i2cCmd(0x40);
-  i2cCmd(0x8D); i2cCmd(0x14);
-  i2cCmd(0xAF);
+  i2cCmd(0xAE);        // display off
+  i2cCmd(0x20); i2cCmd(0x00); // memory addressing mode = horizontal
+  i2cCmd(0x40);        // start line 0
+  i2cCmd(0xA1);        // segment remap
+  i2cCmd(0xC8);        // COM scan dec
+  if (H == 32) {
+    i2cCmd(0xA8); i2cCmd(0x1F); // multiplex ratio 1/32
+    i2cCmd(0xD3); i2cCmd(0x00); // display offset
+    i2cCmd(0xDA); i2cCmd(0x02); // COM pins for 128x32
+  } else if (H == 64) {
+    i2cCmd(0xA8); i2cCmd(0x3F); // multiplex ratio 1/64
+    i2cCmd(0xD3); i2cCmd(0x00);
+    i2cCmd(0xDA); i2cCmd(0x12);
+  } else {
+    i2cCmd(0xA8); i2cCmd(H - 1);
+    i2cCmd(0xD3); i2cCmd(0x00);
+    i2cCmd(0xDA); i2cCmd(0x12);
+  }
+  i2cCmd(0x81); i2cCmd(0x7F); // contrast
+  i2cCmd(0xA6);        // normal display
+  i2cCmd(0xD5); i2cCmd(0x80); // clock div
+  i2cCmd(0xD9); i2cCmd(0xF1); // precharge
+  i2cCmd(0xDB); i2cCmd(0x40); // vcomh
+  i2cCmd(0x8D); i2cCmd(0x14); // charge pump
+  i2cCmd(0xAF);        // display on
   return true;
 }
 
@@ -232,14 +239,8 @@ static void drawSplash() {
   fbClear();
   // no border
   uint8_t titleScale = (W >= 128) ? 2 : 1;
-  int titleY = 0;
-  if (titleY < 0) titleY = 0;
-  fbCenterText(titleY, "QYMERA", titleScale);
-  const char *tag = "local-first automation";
-  int tagY = titleY + 8 * titleScale + 1;
-  fbCenterText(tagY, tag, 1);
-  int divY = tagY + 10;
-  if (divY < H - 10) fbHLine(0, divY, W, true);
+  fbCenterText(0, "QYMERA", titleScale);
+  fbCenterText(16, "LOCAL AUTOMATION", 1);
   char foot[40];
   if (core::is_connected()) {
     IPAddress ip = WiFi.localIP();
@@ -247,38 +248,57 @@ static void drawSplash() {
   } else {
     strcpy(foot, "MESH / ESP-NOW");
   }
-  fbCenterText(H - 8, foot, 1);
-  int scanY = (anim_phase * 2) % (H) + 0;
-  if (scanY >= H) scanY = H-1;
-  fbHLine(0, scanY, W, true);
+  fbCenterText(H - 7, foot, 1);
   panelFlush();
 }
 
 static void drawEntities() {
   fbClear();
-  // no border
   fbText(0, 0, "ENTITIES", 1);
   char hdr[24];
   snprintf(hdr, sizeof(hdr), "%u/%u", (unsigned)entities::localCount(),
            (unsigned)entities::capacity());
-  fbText(W - (int)strlen(hdr) * 6 - 0, 0, hdr, 1);
-  fbHLine(0, 10, W, true);
-  uint8_t lines = (H - 11) / 8;
-  if (lines < 1) lines = 1;
+  int hdrx = W - (int)strlen(hdr) * 6;
+  if (hdrx < 0) hdrx = 0;
+  fbText(hdrx, 0, hdr, 1);
+  fbHLine(0, 8, W, true);
+  const int footer_y = (int)H - 7;
+  const int start_y = 9;
+  int avail = footer_y - start_y;
+  uint8_t lines = 0;
+  if (avail >= 8) lines = avail / 8;
+  if (lines == 0 && avail >= 1) lines = 1;
   uint8_t row = 0;
-  for (uint8_t i = 0; i < entities::capacity() && row < lines; i++) {
+  for (uint8_t i = 0; i < entities::capacity() && lines > 0 && row < lines; i++) {
     if (!entities::isUsed(i)) continue;
     if (i < (uint8_t)scroll_offset) continue;
     const Entity &e = entities::peek(i);
     char glyph = e.state.state ? '*' : 'o';
+    char vbuf[24] = {0};
+    using qymera::model::kindOfType;
+    using qymera::model::EntityKind;
+    if (kindOfType(e.config.type) == EntityKind::ACTUATOR) {
+      if (e.config.type == qymera::model::TYPE_DIMMER) {
+        snprintf(vbuf, sizeof(vbuf), "%d%%", e.state.value);
+      } else {
+        snprintf(vbuf, sizeof(vbuf), "%s", e.state.state ? "ON" : "OFF");
+      }
+    } else {
+      snprintf(vbuf, sizeof(vbuf), "%lu", (unsigned long)e.state.value);
+    }
+    int vx = W - (int)strlen(vbuf) * 6;
+    if (vx < 0) vx = 0;
+    int ry = start_y + row * 8;
+    if (ry + 7 >= footer_y) break;
+    fbText(vx, ry, vbuf, 1);
     char line[40];
     snprintf(line, sizeof(line), "%c %s", glyph, e.config.name);
-    fbText(0, 11 + row * 8, line, 1);
-    if (e.config.type != ::TYPE_RELAY && e.config.type != ::TYPE_DIMMER) {
-      char vbuf[12];
-      snprintf(vbuf, sizeof(vbuf), "%.1f", e.state.value);
-      int vx = W - (int)strlen(vbuf) * 6 - 2;
-      fbText(vx, 11 + row * 8, vbuf, 1);
+    int max_chars = vx / 6;
+    if (max_chars >= 2) {
+      if ((int)strlen(line) > max_chars) line[max_chars] = ' ';
+      fbText(0, ry, line, 1);
+    } else {
+      // not enough room for label safely
     }
     row++;
   }
@@ -289,10 +309,10 @@ static void drawEntities() {
   } else {
     strcpy(foot, "MESH / ESP-NOW");
   }
-  fbCenterText(H - 8, foot, 1);
-  if ((millis() / 500) & 1) fbSet(W - 1, H - 1, true);
+  fbCenterText(H - 7, foot, 1);
   panelFlush();
 }
+
 
 void init(uint16_t width, uint16_t height, uint8_t sda, uint8_t scl) {
   W = width;
@@ -334,9 +354,15 @@ void tick(uint32_t now_ms) {
     int used = 0;
     for (uint8_t i = 0; i < entities::capacity(); i++)
       if (entities::isUsed(i)) used++;
-    uint8_t lines = (H - 11) / 8;
-    if (lines < 1) lines = 1;
-    if (used > lines) {
+    const int footer_y = (int)H - 7;
+    const int start_y = 9;
+    int avail = footer_y - start_y;
+    uint8_t lines = 0;
+    if (avail >= 8) lines = avail / 8;
+    if (lines == 0) lines = 0;
+    if (lines == 0) {
+      scroll_offset = 0;
+    } else if (used > lines) {
       scroll_offset++;
       if (scroll_offset > used - lines) scroll_offset = 0;
     } else {
