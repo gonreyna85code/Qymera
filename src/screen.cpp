@@ -205,7 +205,7 @@ static bool panelInit() {
     i2cCmd(0xD3); i2cCmd(0x00); // offset
     i2cCmd(0x40);              // start line
     i2cCmd(0xA1);              // seg remap
-    i2cCmd(0xC8);              // com scan dec
+    i2cCmd(0xC0);              // com scan inc
     i2cCmd(0xDA); i2cCmd(0x02); // com pins
   } else {
     i2cCmd(0xA8); i2cCmd(H - 1);
