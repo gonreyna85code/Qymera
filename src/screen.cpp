@@ -255,7 +255,6 @@ static bool panelInit() {
 
 static void panelFlush() {
   fbFlipHorizontal();
-  fbFlipVertical();
   i2cCmd(0x21); i2cCmd(0); i2cCmd(W - 1);
   i2cCmd(0x22); i2cCmd(0); i2cCmd((H / 8) - 1);
   for (uint16_t i = 0; i < fb_bytes; i += 16) {
