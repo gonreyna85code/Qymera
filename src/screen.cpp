@@ -237,7 +237,6 @@ static void panelFlush() {
 
 static void drawSplash() {
   fbClear();
-  // no border
   uint8_t titleScale = (W >= 128) ? 2 : 1;
   fbCenterText(0, "QYMERA", titleScale);
   fbCenterText(16, "LOCAL AUTOMATION", 1);
@@ -254,27 +253,23 @@ static void drawSplash() {
 
 static void drawEntities() {
   fbClear();
-  fbText(0, 0, "ENTITIES", 1);
-  char hdr[24];
-  snprintf(hdr, sizeof(hdr), "%u/%u", (unsigned)entities::localCount(),
-           (unsigned)entities::capacity());
-  int hdrx = W - (int)strlen(hdr) * 6;
-  if (hdrx < 0) hdrx = 0;
-  fbText(hdrx, 0, hdr, 1);
-  fbHLine(0, 8, W, true);
-  const int footer_y = (int)H - 7;
-  const int start_y = 9;
+  const int footer_y = (int)H; // use full height for data pages
+  const int start_y = 0;
   int avail = footer_y - start_y;
   uint8_t lines = 0;
-  if (avail >= 8) lines = avail / 8;
-  if (lines == 0 && avail >= 1) lines = 1;
+  if (avail >= 16) lines = 2;
+  else if (avail >= 8) lines = 1;
+  else lines = 0;
+  if (lines == 0) {
+    panelFlush();
+    return;
+  }
   uint8_t row = 0;
-  for (uint8_t i = 0; i < entities::capacity() && lines > 0 && row < lines; i++) {
+  for (uint8_t i = 0; i < entities::capacity() && row < lines; i++) {
     if (!entities::isUsed(i)) continue;
     if (i < (uint8_t)scroll_offset) continue;
     const Entity &e = entities::peek(i);
-    char glyph = e.state.state ? '*' : 'o';
-    char vbuf[24] = {0};
+    char vbuf[32] = {0};
     using qymera::model::kindOfType;
     using qymera::model::EntityKind;
     if (kindOfType(e.config.type) == EntityKind::ACTUATOR) {
@@ -283,8 +278,22 @@ static void drawEntities() {
       } else {
         snprintf(vbuf, sizeof(vbuf), "%s", e.state.state ? "ON" : "OFF");
       }
-    } else {
+    } else if (e.config.type == qymera::model::SENSOR_TIME) {
+      // Try to format time-like values if small; otherwise show raw
       snprintf(vbuf, sizeof(vbuf), "%lu", (unsigned long)e.state.value);
+    } else if (e.config.type == qymera::model::SENSOR_TEMP ||
+               e.config.type == qymera::model::SENSOR_HUMI ||
+               e.config.type == qymera::model::SENSOR_PRESS ||
+               e.config.type == qymera::model::SENSOR_LUMI ||
+               e.config.type == qymera::model::SENSOR_GENERIC) {
+      // Show with reasonable precision like calibration/GUI style
+      float fv = e.state.value;
+      // if value_f not set meaningfully, use value
+      snprintf(vbuf, sizeof(vbuf), "%.1f", fv);
+    } else {
+      float fv = e.state.value;
+      if (fv == 0.0f) snprintf(vbuf, sizeof(vbuf), "%lu", (unsigned long)e.state.value);
+      else snprintf(vbuf, sizeof(vbuf), "%.2f", fv);
     }
     int vx = W - (int)strlen(vbuf) * 6;
     if (vx < 0) vx = 0;
@@ -292,24 +301,16 @@ static void drawEntities() {
     if (ry + 7 >= footer_y) break;
     fbText(vx, ry, vbuf, 1);
     char line[40];
-    snprintf(line, sizeof(line), "%c %s", glyph, e.config.name);
+    snprintf(line, sizeof(line), "%s", e.config.name);
     int max_chars = vx / 6;
-    if (max_chars >= 2) {
+    if (max_chars >= 1) {
       if ((int)strlen(line) > max_chars) line[max_chars] = ' ';
       fbText(0, ry, line, 1);
-    } else {
-      // not enough room for label safely
     }
     row++;
   }
-  char foot[40];
-  if (core::is_connected()) {
-    IPAddress ip = WiFi.localIP();
-    snprintf(foot, sizeof(foot), "IP %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-  } else {
-    strcpy(foot, "MESH / ESP-NOW");
-  }
-  fbCenterText(H - 7, foot, 1);
+  // Use both available rows fully - if only 1 row of entities, we still have space
+  // but requirement says use 2 unused rows; with 2 lines we consume both rows
   panelFlush();
 }
 
@@ -349,31 +350,28 @@ void tick(uint32_t now_ms) {
     return;
   }
   if (!initialised) return;
-  if (now_ms - last_scroll_ms >= 1500) {
+  // Scroll entities for multi-page if more than 2 rows of data
+  if (now_ms - last_scroll_ms >= 4000) {
     last_scroll_ms = now_ms;
     int used = 0;
     for (uint8_t i = 0; i < entities::capacity(); i++)
       if (entities::isUsed(i)) used++;
-    const int footer_y = (int)H - 7;
-    const int start_y = 9;
-    int avail = footer_y - start_y;
-    uint8_t lines = 0;
-    if (avail >= 8) lines = avail / 8;
-    if (lines == 0) lines = 0;
-    if (lines == 0) {
-      scroll_offset = 0;
-    } else if (used > lines) {
-      scroll_offset++;
-      if (scroll_offset > used - lines) scroll_offset = 0;
+    if (used > 2) {
+      scroll_offset += 2;
+      if (scroll_offset > used - 2) scroll_offset = 0;
     } else {
       scroll_offset = 0;
     }
   }
-  if (now_ms - last_redraw_ms >= 250) {
+  // Splash every 60 seconds, data pages every 4 seconds
+  if (now_ms - last_redraw_ms >= 4000) {
     last_redraw_ms = now_ms;
     anim_phase++;
-    if ((now_ms / 6000) & 1) drawSplash();
-    else drawEntities();
+    if ((now_ms % 60000) < 4000) {
+      drawSplash();
+    } else {
+      drawEntities();
+    }
   }
 }
 
