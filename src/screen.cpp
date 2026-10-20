@@ -1,3 +1,7 @@
+#ifndef SCREEN_DIAG
+#define SCREEN_DIAG 0
+#endif
+
 #include <Arduino.h>
 #include <Wire.h>
 #include "screen.h"
@@ -235,6 +239,34 @@ static void panelFlush() {
   }
 }
 
+
+#if SCREEN_DIAG
+static void runDiag() {
+  fbClear();
+  // fill all
+  for (uint16_t i = 0; i < fb_bytes; i++) fb[i] = 0xFF;
+  panelFlush();
+  delay(1000);
+  fbClear();
+  panelFlush();
+  delay(500);
+  fbClear();
+  // frame
+  fbRect(0,0,W,H,true);
+  fbSet(0,0,true); fbSet(W-1,0,true); fbSet(0,H-1,true); fbSet(W-1,H-1,true);
+  panelFlush();
+  delay(1000);
+  fbClear();
+  // lines
+  if (H>0) fbHLine(0,0,W,true);
+  if (H>1) fbHLine(0,H/2,W,true);
+  if (H>2) fbHLine(0,H-2,W,true);
+  if (H>1) fbHLine(0,H-1,W,true);
+  panelFlush();
+  delay(1500);
+}
+#endif
+
 static void drawSplash() {
   fbClear();
   uint8_t titleScale = (W >= 128) ? 2 : 1;
@@ -340,6 +372,10 @@ void tick(uint32_t now_ms) {
         initialised = true;
         init_pending = false;
         last_redraw_ms = now_ms;
+#if SCREEN_DIAG
+        runDiag();
+        return;
+#endif
         drawSplash();
       } else {
         init_due_ms = now_ms + 5000;
