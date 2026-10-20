@@ -26,6 +26,19 @@ static uint16_t fb_bytes = 0;
 static int scroll_offset = 0;
 static uint32_t last_scroll_ms = 0;
 
+
+static void fbFlipVertical() {
+  for (uint8_t p = 0; p < H / 8 / 2; p++) {
+    uint16_t row1 = p * W;
+    uint16_t row2 = (H / 8 - 1 - p) * W;
+    for (uint16_t i = 0; i < W; i++) {
+      uint8_t tval = fb[row1 + i];
+      fb[row1 + i] = fb[row2 + i];
+      fb[row2 + i] = tval;
+    }
+  }
+}
+
 static void fbFlipHorizontal() {
   for (uint8_t p = 0; p < H / 8; p++) {
     uint16_t row = p * W;
@@ -242,6 +255,7 @@ static bool panelInit() {
 
 static void panelFlush() {
   fbFlipHorizontal();
+  fbFlipVertical();
   i2cCmd(0x21); i2cCmd(0); i2cCmd(W - 1);
   i2cCmd(0x22); i2cCmd(0); i2cCmd((H / 8) - 1);
   for (uint16_t i = 0; i < fb_bytes; i += 16) {
