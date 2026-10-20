@@ -197,6 +197,9 @@ static void setupWiFiEvents() {
       if (wifi_state == WifiState::STA_CONNECTED) {
         wifi_state = WifiState::STA_DISCONNECTED_RETRY;
         last_disconnect_time = millis();
+      } else if (wifi_state == WifiState::STA_CONNECTING) {
+        // Still connecting; don't alter state machine, let timeout decide
+        last_disconnect_time = millis();
       }
       last_disconnect_reason = info.wifi_sta_disconnected.reason;
       // Dedup: only log when the reason changes (avoid event storms).
@@ -220,6 +223,9 @@ static void setupWiFiEvents() {
       wifi_connected = false;
       if (wifi_state == WifiState::STA_CONNECTED) {
         wifi_state = WifiState::STA_DISCONNECTED_RETRY;
+        last_disconnect_time = millis();
+      } else if (wifi_state == WifiState::STA_CONNECTING) {
+        // Still connecting; don't alter state machine, let timeout decide
         last_disconnect_time = millis();
       }
       last_disconnect_reason = (uint8_t)e.reason;
