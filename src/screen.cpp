@@ -257,9 +257,7 @@ static void drawEntities() {
   const int start_y = 0;
   int avail = footer_y - start_y;
   uint8_t lines = 0;
-  if (avail >= 16) lines = 2;
-  else if (avail >= 8) lines = 1;
-  else lines = 0;
+  if (avail >= 8) lines = avail / 8;
   if (lines == 0) {
     panelFlush();
     return;
