@@ -212,7 +212,7 @@ static bool panelInit() {
   i2cCmd(0xD3); i2cCmd(0x00);
   i2cCmd(0xD5); i2cCmd(0x80);
   i2cCmd(0xD9); i2cCmd(0xF1);
-  i2cCmd(0xDA); i2cCmd((H == 32) ? 0x02 : 0x12);
+  i2cCmd(0xDA); i2cCmd((H == 32) ? 0x12 : 0x12);
   i2cCmd(0xDB); i2cCmd(0x40);
   i2cCmd(0x8D); i2cCmd(0x14);
   i2cCmd(0xAF);
@@ -230,16 +230,16 @@ static void panelFlush() {
 
 static void drawSplash() {
   fbClear();
-  fbRect(0, 0, W, H, true);
+  // no border
   uint8_t titleScale = (W >= 128) ? 2 : 1;
-  int titleY = (H / 2) - (7 * titleScale) - 6;
-  if (titleY < 4) titleY = 4;
+  int titleY = 0;
+  if (titleY < 0) titleY = 0;
   fbCenterText(titleY, "QYMERA", titleScale);
   const char *tag = "local-first automation";
-  int tagY = titleY + 7 * titleScale + 4;
+  int tagY = titleY + 8 * titleScale + 1;
   fbCenterText(tagY, tag, 1);
   int divY = tagY + 10;
-  if (divY < H - 12) fbHLine(8, divY, W - 16, true);
+  if (divY < H - 10) fbHLine(0, divY, W, true);
   char foot[40];
   if (core::is_connected()) {
     IPAddress ip = WiFi.localIP();
@@ -247,22 +247,23 @@ static void drawSplash() {
   } else {
     strcpy(foot, "MESH / ESP-NOW");
   }
-  fbCenterText(H - 10, foot, 1);
-  int scanY = (anim_phase * 3) % (H - 4) + 2;
-  fbHLine(2, scanY, W - 4, true);
+  fbCenterText(H - 8, foot, 1);
+  int scanY = (anim_phase * 2) % (H) + 0;
+  if (scanY >= H) scanY = H-1;
+  fbHLine(0, scanY, W, true);
   panelFlush();
 }
 
 static void drawEntities() {
   fbClear();
-  fbRect(0, 0, W, H, true);
-  fbText(2, 2, "ENTITIES", 1);
+  // no border
+  fbText(0, 0, "ENTITIES", 1);
   char hdr[24];
   snprintf(hdr, sizeof(hdr), "%u/%u", (unsigned)entities::localCount(),
            (unsigned)entities::capacity());
-  fbText(W - (int)strlen(hdr) * 6 - 2, 2, hdr, 1);
-  fbHLine(1, 11, W - 2, true);
-  uint8_t lines = (H - 12) / 8;
+  fbText(W - (int)strlen(hdr) * 6 - 0, 0, hdr, 1);
+  fbHLine(0, 10, W, true);
+  uint8_t lines = (H - 11) / 8;
   if (lines < 1) lines = 1;
   uint8_t row = 0;
   for (uint8_t i = 0; i < entities::capacity() && row < lines; i++) {
@@ -272,12 +273,12 @@ static void drawEntities() {
     char glyph = e.state.state ? '*' : 'o';
     char line[40];
     snprintf(line, sizeof(line), "%c %s", glyph, e.config.name);
-    fbText(2, 12 + row * 8, line, 1);
+    fbText(0, 11 + row * 8, line, 1);
     if (e.config.type != ::TYPE_RELAY && e.config.type != ::TYPE_DIMMER) {
       char vbuf[12];
       snprintf(vbuf, sizeof(vbuf), "%.1f", e.state.value);
       int vx = W - (int)strlen(vbuf) * 6 - 2;
-      fbText(vx, 12 + row * 8, vbuf, 1);
+      fbText(vx, 11 + row * 8, vbuf, 1);
     }
     row++;
   }
@@ -288,8 +289,8 @@ static void drawEntities() {
   } else {
     strcpy(foot, "MESH / ESP-NOW");
   }
-  fbCenterText(H - 9, foot, 1);
-  if ((millis() / 500) & 1) fbSet(W - 2, H - 2, true);
+  fbCenterText(H - 8, foot, 1);
+  if ((millis() / 500) & 1) fbSet(W - 1, H - 1, true);
   panelFlush();
 }
 
@@ -333,7 +334,7 @@ void tick(uint32_t now_ms) {
     int used = 0;
     for (uint8_t i = 0; i < entities::capacity(); i++)
       if (entities::isUsed(i)) used++;
-    uint8_t lines = (H - 12) / 8;
+    uint8_t lines = (H - 11) / 8;
     if (lines < 1) lines = 1;
     if (used > lines) {
       scroll_offset++;
