@@ -26,6 +26,16 @@ static uint16_t fb_bytes = 0;
 static int scroll_offset = 0;
 static uint32_t last_scroll_ms = 0;
 
+static void fbFlipHorizontal() {
+  for (uint8_t p = 0; p < H / 8; p++) {
+    uint16_t row = p * W;
+    for (uint8_t x = 0; x < W / 2; x++) {
+      uint8_t tval = fb[row + x];
+      fb[row + x] = fb[row + (W - 1 - x)];
+      fb[row + (W - 1 - x)] = tval;
+    }
+  }
+}
 static const uint8_t FONT5x7[][5] PROGMEM = {
   {0x00,0x00,0x00,0x00,0x00},
   {0x00,0x00,0x5F,0x00,0x00},
@@ -231,6 +241,7 @@ static bool panelInit() {
 }
 
 static void panelFlush() {
+  fbFlipHorizontal();
   i2cCmd(0x21); i2cCmd(0); i2cCmd(W - 1);
   i2cCmd(0x22); i2cCmd(0); i2cCmd((H / 8) - 1);
   for (uint16_t i = 0; i < fb_bytes; i += 16) {
