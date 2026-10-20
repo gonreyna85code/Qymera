@@ -247,7 +247,7 @@ static void drawSplash() {
   } else {
     strcpy(foot, "MESH / ESP-NOW");
   }
-  fbCenterText(H - 7, foot, 1);
+  fbCenterText(26, foot, 1);
   panelFlush();
 }
 
@@ -257,7 +257,7 @@ static void drawEntities() {
   const int start_y = 0;
   int avail = footer_y - start_y;
   uint8_t lines = 0;
-  if (avail >= 8) lines = avail / 8;
+  lines = avail / 5; if (lines > 6) lines = 6; if (lines < 0) lines = 0;
   if (lines == 0) {
     panelFlush();
     return;
@@ -295,8 +295,8 @@ static void drawEntities() {
     }
     int vx = W - (int)strlen(vbuf) * 6;
     if (vx < 0) vx = 0;
-    int ry = start_y + row * 8;
-    if (ry + 7 >= footer_y) break;
+    int ry = start_y + row * 5;
+    if (ry + 6 >= footer_y) break;
     fbText(vx, ry, vbuf, 1);
     char line[40];
     snprintf(line, sizeof(line), "%s", e.config.name);
