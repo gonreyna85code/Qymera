@@ -199,30 +199,30 @@ static void fbCenterText(int y, const char *s, uint8_t scale) {
 static bool panelInit() {
   if (!probe(0x3C) && !probe(0x3D)) return false;
   i2cCmd(0xAE);        // display off
-  i2cCmd(0x20); i2cCmd(0x00); // memory addressing mode = horizontal
-  i2cCmd(0x40);        // start line 0
-  i2cCmd(0xA1);        // segment remap
-  i2cCmd(0xC8);        // COM scan dec
+  i2cCmd(0xD5); i2cCmd(0x80); // clock
   if (H == 32) {
-    i2cCmd(0xA8); i2cCmd(0x1F); // multiplex ratio 1/32
-    i2cCmd(0xD3); i2cCmd(0x00); // display offset
-    i2cCmd(0xDA); i2cCmd(0x02); // COM pins for 128x32
-  } else if (H == 64) {
-    i2cCmd(0xA8); i2cCmd(0x3F); // multiplex ratio 1/64
-    i2cCmd(0xD3); i2cCmd(0x00);
-    i2cCmd(0xDA); i2cCmd(0x12);
+    i2cCmd(0xA8); i2cCmd(0x1F); // multiplex 1/32
+    i2cCmd(0xD3); i2cCmd(0x00); // offset
+    i2cCmd(0x40);              // start line
+    i2cCmd(0xA1);              // seg remap
+    i2cCmd(0xC8);              // com scan dec
+    i2cCmd(0xDA); i2cCmd(0x02); // com pins
   } else {
     i2cCmd(0xA8); i2cCmd(H - 1);
     i2cCmd(0xD3); i2cCmd(0x00);
-    i2cCmd(0xDA); i2cCmd(0x12);
+    i2cCmd(0x40);
+    i2cCmd(0xA1);
+    i2cCmd(0xC8);
+    i2cCmd(0xDA); i2cCmd((H == 64) ? 0x12 : 0x12);
   }
-  i2cCmd(0x81); i2cCmd(0x7F); // contrast
-  i2cCmd(0xA6);        // normal display
-  i2cCmd(0xD5); i2cCmd(0x80); // clock div
+  i2cCmd(0x81); i2cCmd(0xCF); // contrast
   i2cCmd(0xD9); i2cCmd(0xF1); // precharge
   i2cCmd(0xDB); i2cCmd(0x40); // vcomh
+  i2cCmd(0xA4);              // display follows RAM
+  i2cCmd(0xA6);              // normal
   i2cCmd(0x8D); i2cCmd(0x14); // charge pump
-  i2cCmd(0xAF);        // display on
+  i2cCmd(0xAF);              // display on
+  i2cCmd(0x20); i2cCmd(0x00); // horizontal addressing
   return true;
 }
 
