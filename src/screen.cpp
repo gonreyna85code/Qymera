@@ -219,7 +219,7 @@ static bool panelInit() {
   i2cCmd(0xD9); i2cCmd(0xF1); // precharge
   i2cCmd(0xDB); i2cCmd(0x40); // vcomh
   i2cCmd(0xA4);              // display follows RAM
-  i2cCmd(0xA7);              // inverted? try flip
+  i2cCmd(0xA6);              // normal
   i2cCmd(0x8D); i2cCmd(0x14); // charge pump
   i2cCmd(0xAF);              // display on
   i2cCmd(0x20); i2cCmd(0x00); // horizontal addressing
